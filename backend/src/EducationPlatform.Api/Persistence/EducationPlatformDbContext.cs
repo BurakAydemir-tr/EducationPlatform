@@ -3,7 +3,9 @@ using EducationPlatform.Api.Persistence.Courses;
 using EducationPlatform.Api.Persistence.Identity;
 using EducationPlatform.Domain.Classrooms;
 using EducationPlatform.Domain.Courses;
+using EducationPlatform.Domain.Progress;
 using EducationPlatform.Domain.Quizzes;
+using EducationPlatform.Domain.QuizAttempts;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
@@ -27,6 +29,12 @@ public sealed class EducationPlatformDbContext(
     public DbSet<CourseClassroomAssignment> CourseClassroomAssignments => Set<CourseClassroomAssignment>();
 
     public DbSet<Quiz> Quizzes => Set<Quiz>();
+
+    public DbSet<QuizAttempt> QuizAttempts => Set<QuizAttempt>();
+
+    public DbSet<QuizAttemptAnswer> QuizAttemptAnswers => Set<QuizAttemptAnswer>();
+
+    public DbSet<ContentProgress> ContentProgress => Set<ContentProgress>();
 
     public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 

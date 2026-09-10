@@ -5,11 +5,13 @@ using EducationPlatform.Api.Authentication;
 using EducationPlatform.Api.Features.Auth;
 using EducationPlatform.Api.Features.Classrooms;
 using EducationPlatform.Api.Features.Courses;
+using EducationPlatform.Api.Features.Learning;
 using EducationPlatform.Api.Features.Quizzes;
 using EducationPlatform.Api.Persistence;
 using EducationPlatform.Api.Persistence.Courses;
 using EducationPlatform.Api.Persistence.Identity;
 using EducationPlatform.Domain.Courses;
+using EducationPlatform.Domain.QuizAttempts;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
@@ -214,6 +216,185 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         Assert.Single(responses, response => response.StatusCode == HttpStatusCode.Created);
         var conflict = Assert.Single(responses, response => response.StatusCode == HttpStatusCode.Conflict);
         await AssertProblemCode(conflict, "quiz_already_assigned");
+    }
+
+    [Fact]
+    public async Task Student_CanCompleteContentAndQuiz_ReportsAreCalculated_AndLostAccessRemovesOnlyIncompleteAttempt()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var room = await CreateRoomAndAddStudent(teacher, studentId, "Learning room");
+        var setup = await CreatePublishedLearningCourse(teacher, [room]);
+
+        var topicComplete = await student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        Assert.Equal(HttpStatusCode.NoContent, topicComplete.StatusCode);
+        var repeatedTopicComplete = await student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        Assert.Equal(HttpStatusCode.NoContent, repeatedTopicComplete.StatusCode);
+
+        async Task<(Guid AttemptId, QuizQuestionResponse Question)> Start()
+        {
+            var response = await student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            var json = await response.Content.ReadAsStringAsync();
+            Assert.DoesNotContain("isCorrect", json, StringComparison.OrdinalIgnoreCase);
+            var body = System.Text.Json.JsonSerializer.Deserialize<StartQuizAttemptResponse>(json, new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web));
+            return (body!.AttemptId, Assert.Single(body.Questions));
+        }
+
+        var first = await Start();
+        var correct = first.Question.Options.Single(option => option.Order == 1);
+        var invalidComplete = await student.PostAsJsonAsync($"/api/student/quiz-attempts/{first.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(first.Question.Id, Guid.NewGuid())]));
+        Assert.Equal(HttpStatusCode.BadRequest, invalidComplete.StatusCode);
+        await AssertProblemCode(invalidComplete, "invalid_quiz_answers");
+        var firstComplete = await student.PostAsJsonAsync($"/api/student/quiz-attempts/{first.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(first.Question.Id, correct.Id)]));
+        var firstResult = await firstComplete.Content.ReadFromJsonAsync<QuizAttemptResultResponse>();
+        Assert.Equal(HttpStatusCode.OK, firstComplete.StatusCode);
+        Assert.Equal(100m, firstResult!.Score);
+
+        var second = await Start();
+        var wrong = second.Question.Options.Single(option => option.Order == 2);
+        var secondComplete = await student.PostAsJsonAsync($"/api/student/quiz-attempts/{second.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(second.Question.Id, wrong.Id)]));
+        var secondResult = await secondComplete.Content.ReadFromJsonAsync<QuizAttemptResultResponse>();
+        Assert.Equal(0m, secondResult!.Score);
+
+        var progress = await student.GetFromJsonAsync<CourseProgressResponse>($"/api/student/courses/{setup.CourseId}/progress");
+        Assert.Equal(2, progress!.CompletedContentCount);
+        Assert.Equal(2, progress.TotalContentCount);
+        Assert.Equal(100m, progress.Percentage);
+        var teacherProgress = await teacher.GetFromJsonAsync<CourseProgressResponse>($"/api/courses/{setup.CourseId}/students/{studentId}/progress");
+        Assert.Equal(100m, teacherProgress!.Percentage);
+
+        var directQuizCompletion = await student.PostAsync($"/api/student/contents/{setup.QuizContentId}/complete", null);
+        Assert.Equal(HttpStatusCode.BadRequest, directQuizCompletion.StatusCode);
+        await AssertProblemCode(directQuizCompletion, "content_cannot_be_completed_directly");
+
+        var report = await teacher.GetFromJsonAsync<List<TeacherQuizResultResponse>>($"/api/courses/{setup.CourseId}/students/{studentId}/quiz-results");
+        var quizReport = Assert.Single(report!);
+        Assert.Equal(2, quizReport.AttemptCount);
+        Assert.Equal(100m, quizReport.FirstScore);
+        Assert.Equal(0m, quizReport.LastScore);
+        Assert.Equal(100m, quizReport.BestScore);
+
+        var incomplete = await Start();
+        var remove = await teacher.DeleteAsync($"/api/classrooms/{room}/students/{studentId}");
+        Assert.Equal(HttpStatusCode.NoContent, remove.StatusCode);
+
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+            Assert.False(await db.QuizAttempts.AnyAsync(item => item.Id == incomplete.AttemptId));
+            Assert.Equal(2, await db.QuizAttempts.CountAsync(item => item.StudentId == studentId && item.QuizId == setup.QuizId && item.CompletedAt != null));
+            Assert.Equal(2, await db.ContentProgress.CountAsync(item => item.StudentId == studentId));
+        }
+
+        var cannotComplete = await student.PostAsJsonAsync($"/api/student/quiz-attempts/{incomplete.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(incomplete.Question.Id, incomplete.Question.Options[0].Id)]));
+        Assert.Equal(HttpStatusCode.NotFound, cannotComplete.StatusCode);
+        var cannotStart = await student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        Assert.Equal(HttpStatusCode.NotFound, cannotStart.StatusCode);
+        var preservedResult = await student.GetAsync($"/api/student/quiz-attempts/{first.AttemptId}");
+        Assert.Equal(HttpStatusCode.OK, preservedResult.StatusCode);
+
+        report = await teacher.GetFromJsonAsync<List<TeacherQuizResultResponse>>($"/api/courses/{setup.CourseId}/students/{studentId}/quiz-results");
+        Assert.Equal(2, Assert.Single(report!).AttemptCount);
+        teacherProgress = await teacher.GetFromJsonAsync<CourseProgressResponse>($"/api/courses/{setup.CourseId}/students/{studentId}/progress");
+        Assert.Equal(100m, teacherProgress!.Percentage);
+    }
+
+    [Fact]
+    public async Task IncompleteAttempt_IsKeptWhileAnotherClassroomStillProvidesCourseAccess()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var firstRoom = await CreateRoomAndAddStudent(teacher, studentId, "Alternative access one");
+        var secondRoom = await CreateRoomAndAddStudent(teacher, studentId, "Alternative access two");
+        var setup = await CreatePublishedLearningCourse(teacher, [firstRoom, secondRoom]);
+        var start = await student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        var attempt = await start.Content.ReadFromJsonAsync<StartQuizAttemptResponse>();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.DeleteAsync($"/api/classrooms/{firstRoom}/students/{studentId}")).StatusCode);
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+            Assert.True(await db.QuizAttempts.AnyAsync(item => item.Id == attempt!.AttemptId));
+        }
+
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.DeleteAsync($"/api/classrooms/{secondRoom}/students/{studentId}")).StatusCode);
+        await using var finalScope = _factory!.Services.CreateAsyncScope();
+        var finalDb = finalScope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.False(await finalDb.QuizAttempts.AnyAsync(item => item.Id == attempt!.AttemptId));
+    }
+
+    [Fact]
+    public async Task RemovingCourseAssignments_DeletesIncompleteAttemptOnlyAfterLastAccessPathEnds()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var firstRoom = await CreateRoomAndAddStudent(teacher, studentId, "Assignment access one");
+        var secondRoom = await CreateRoomAndAddStudent(teacher, studentId, "Assignment access two");
+        var setup = await CreatePublishedLearningCourse(teacher, [firstRoom, secondRoom]);
+        var start = await student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        var attempt = await start.Content.ReadFromJsonAsync<StartQuizAttemptResponse>();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.DeleteAsync($"/api/courses/{setup.CourseId}/classrooms/{firstRoom}")).StatusCode);
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+            Assert.True(await db.QuizAttempts.AnyAsync(item => item.Id == attempt!.AttemptId));
+        }
+
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.DeleteAsync($"/api/courses/{setup.CourseId}/classrooms/{secondRoom}")).StatusCode);
+        await using var finalScope = _factory!.Services.CreateAsyncScope();
+        var finalDb = finalScope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.False(await finalDb.QuizAttempts.AnyAsync(item => item.Id == attempt!.AttemptId));
+    }
+
+    private async Task<Guid> StudentId()
+    {
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        return await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().Users
+            .Where(user => user.UserName == "course-student").Select(user => user.Id).SingleAsync();
+    }
+
+    private async Task<Guid> CreateRoomAndAddStudent(HttpClient teacher, Guid studentId, string name)
+    {
+        var roomResponse = await teacher.PostAsJsonAsync("/api/classrooms", new CreateClassroomRequest(name));
+        var room = await roomResponse.Content.ReadFromJsonAsync<CreateClassroomResponse>();
+        var add = await teacher.PostAsJsonAsync($"/api/classrooms/{room!.Id}/students", new AddStudentRequest("course-student"));
+        Assert.Equal(HttpStatusCode.NoContent, add.StatusCode);
+        return room.Id;
+    }
+
+    private async Task<(Guid CourseId, Guid TopicId, Guid QuizId, Guid QuizContentId)> CreatePublishedLearningCourse(HttpClient teacher, IReadOnlyList<Guid> classroomIds)
+    {
+        var courseResponse = await teacher.PostAsJsonAsync("/api/courses", new CreateCourseRequest($"Learning {Guid.NewGuid():N}", null));
+        var course = await courseResponse.Content.ReadFromJsonAsync<CreateCourseResponse>();
+        var weekResponse = await teacher.PostAsJsonAsync($"/api/courses/{course!.Id}/weeks", new AddWeekRequest("Week", 1));
+        var week = await weekResponse.Content.ReadFromJsonAsync<WeekSummaryResponse>();
+        var topicResponse = await teacher.PostAsJsonAsync($"/api/courses/{course.Id}/weeks/{week!.Id}/contents/topic", new AddTopicRequest("Topic", 1, "Text"));
+        var topic = await topicResponse.Content.ReadFromJsonAsync<WeekContentResponse>();
+        var quizResponse = await teacher.PostAsJsonAsync("/api/quizzes", new CreateQuizRequest("Learning quiz",
+        [
+            new CreateQuestionRequest("Question", 1,
+            [
+                new CreateOptionRequest("Correct", 1, true),
+                new CreateOptionRequest("Wrong", 2, false)
+            ])
+        ]));
+        var quiz = await quizResponse.Content.ReadFromJsonAsync<CreateQuizResponse>();
+        var quizContentResponse = await teacher.PostAsJsonAsync($"/api/courses/{course.Id}/weeks/{week.Id}/contents/quiz", new AddQuizContentRequest("Quiz", 2, quiz!.Id));
+        Assert.Equal(HttpStatusCode.Created, quizContentResponse.StatusCode);
+        var quizContent = await quizContentResponse.Content.ReadFromJsonAsync<WeekContentResponse>();
+        foreach (var classroomId in classroomIds)
+            Assert.Equal(HttpStatusCode.NoContent, (await teacher.PostAsync($"/api/courses/{course.Id}/classrooms/{classroomId}", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.PostAsync($"/api/courses/{course.Id}/publish", null)).StatusCode);
+        return (course.Id, topic!.Id, quiz.Id, quizContent!.Id);
     }
 
     public async Task InitializeAsync()

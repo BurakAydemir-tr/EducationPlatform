@@ -5,6 +5,7 @@ using EducationPlatform.Api.Common.Results;
 using EducationPlatform.Api.Features.Auth;
 using EducationPlatform.Api.Features.Classrooms;
 using EducationPlatform.Api.Features.Courses;
+using EducationPlatform.Api.Features.Learning;
 using EducationPlatform.Api.Features.Quizzes;
 using EducationPlatform.Api.Features.Students;
 using EducationPlatform.Api.Persistence;
@@ -110,6 +111,7 @@ app.UseAuthorization();
 app.MapAuthEndpoints();
 app.MapClassroomEndpoints();
 app.MapCourseEndpoints();
+app.MapLearningEndpoints();
 app.MapQuizEndpoints();
 app.MapStudentEndpoints();
 

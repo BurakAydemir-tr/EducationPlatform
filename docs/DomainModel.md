@@ -300,7 +300,7 @@ Classroom–Student ve Course–Classroom çoktan çoğa ilişkileri persistence
 - Aynı öğrenci için yeni hesap açılması yerine mümkünse mevcut kullanıcı hesabı kullanılmalıdır.
 - Öğrenci Classroom’dan çıkarıldığında bu Classroom üzerinden sağlanan yeni içerik erişimini kaybeder.
 - Öğrenci başka bir Classroom üzerinden aynı Course’a erişebiliyorsa Course erişimi devam eder.
-- Öğrenci Classroom’dan çıkarıldığında geçmiş ContentProgress ve QuizAttempt kayıtları silinmez.
+- Öğrenci Classroom’dan çıkarıldığında ContentProgress ve tamamlanmış QuizAttempt geçmişi silinmez; Course erişimi tamamen sona ererse o Course kapsamındaki tamamlanmamış QuizAttempt kayıtları silinir.
 - Classroom–Student ilişkisi persistence katmanında join table ile tutulabilir.
 - İleride üyelik geçmişi gerektiğinde `JoinedAt` ve `LeftAt` gibi bilgiler persistence modelinde tutulabilir. Bunun için ayrı bir domain entity gerekli değildir.
 
@@ -352,7 +352,7 @@ Classroom–Student ve Course–Classroom çoktan çoğa ilişkileri persistence
 - Tamamlanmamış deneme ilerleme ve başarı raporlarına dahil edilmez.
 - Tamamlanmış bir QuizAttempt ilgili Quiz türündeki WeekContent’in tamamlanmasını sağlar.
 - Birden fazla deneme yeni ContentProgress kayıtları oluşturmaz.
-- QuizAttempt geçmişi hiçbir erişim veya üyelik değişikliğinde silinmez.
+- Tamamlanmış QuizAttempt geçmişi erişim veya üyelik değişikliğinde silinmez; Course erişimi tamamen sona erdiğinde o Course kapsamındaki tamamlanmamış QuizAttempt kayıtları silinir.
 - Öğretmen raporunda aşağıdaki değerler QuizAttempt kayıtlarından hesaplanır:
   - Deneme sayısı
   - İlk puan
@@ -415,7 +415,10 @@ Ek kurallar:
 - Öğrenci yalnızca erişebildiği Course’un CourseWeek ve WeekContent öğelerini görebilir.
 - Öğrenci yalnızca erişebildiği Quiz için QuizAttempt başlatabilir.
 - Öğrenci yalnızca erişebildiği WeekContent için ContentProgress oluşturabilir.
-- Öğrencinin sonradan erişimi kaybetmesi geçmiş kayıtlarını silmez.
+- Öğrenci Course'a olan aktif erişimini tamamen kaybettiğinde o Course kapsamındaki tamamlanmamış QuizAttempt kayıtları silinir.
+- Öğrenci aynı Course'a başka bir Classroom üzerinden hâlâ aktif erişebiliyorsa tamamlanmamış QuizAttempt kayıtları silinmez.
+- Erişim tamamen sona erdikten sonra öğrenci yeni QuizAttempt başlatamaz ve mevcut tamamlanmamış QuizAttempt'ı tamamlayamaz.
+- Öğrencinin sonradan erişimi kaybetmesi tamamlanmış QuizAttempt ve ContentProgress geçmişini silmez.
 - Course’un Classroom’dan kaldırılması o Classroom üzerinden yeni erişimi sona erdirir.
 - Course–Classroom ilişkisinin kaldırılması geçmiş raporlamayı bozacak şekilde fiziksel veri kaybına neden olmamalıdır.
 
@@ -424,17 +427,19 @@ Ek kurallar:
 Aşağıdaki kayıtlar geçmiş eğitim verisi olarak kabul edilir:
 
 - ContentProgress kayıtları
-- Başlatılmış ve tamamlanmış QuizAttempt kayıtları
+- Tamamlanmış QuizAttempt kayıtları
 - QuizAttempt cevapları
 - QuizAttempt sonuçları
 - Deneme bulunan eski Quiz’ler
 
 Kurallar:
 
-- Öğrenci Classroom’dan çıkarıldığında geçmiş ilerleme ve test sonuçları korunur.
-- Course Classroom’dan kaldırıldığında geçmiş ilerleme ve test sonuçları korunur.
-- Öğrenci Course erişimini tamamen kaybetse bile geçmiş kayıtları silinmez.
-- QuizAttempt geçmişi fiziksel olarak silinmez.
+- Öğrenci Classroom’dan çıkarıldığında tamamlanmış QuizAttempt ve ContentProgress geçmişi korunur.
+- Course Classroom’dan kaldırıldığında tamamlanmış QuizAttempt ve ContentProgress geçmişi korunur.
+- Öğrenci Course erişimini tamamen kaybetse bile tamamlanmış QuizAttempt ve ContentProgress geçmişi silinmez.
+- Öğrenci Course'a olan aktif erişimini tamamen kaybettiğinde yalnızca o Course kapsamındaki tamamlanmamış QuizAttempt kayıtları silinir.
+- Öğrencinin aynı Course'a başka bir Classroom üzerinden aktif erişimi sürüyorsa tamamlanmamış QuizAttempt kayıtları korunur.
+- Tamamlanmış QuizAttempt geçmişi fiziksel olarak silinmez.
 - Tamamlanmış QuizAttempt değiştirilemez.
 - Deneme başlanmış Quiz değiştirilemez veya fiziksel olarak silinemez.
 - Eski Quiz yerine yeni Quiz kullanılacaksa eski Quiz ve denemeleri korunur.

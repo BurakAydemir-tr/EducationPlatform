@@ -1,5 +1,6 @@
 using EducationPlatform.Api.Authentication;
 using EducationPlatform.Api.Common.Results;
+using EducationPlatform.Api.Features.Learning;
 using EducationPlatform.Api.Persistence;
 using EducationPlatform.Api.Persistence.Configurations;
 using EducationPlatform.Api.Persistence.Courses;
@@ -320,8 +321,20 @@ public static class CourseEndpoints
         if (!await db.Courses.AnyAsync(course => course.Id == courseId && course.TeacherId == teacherId, context.RequestAborted)) return CourseNotFound(context);
         var assignment = await db.CourseClassroomAssignments.SingleOrDefaultAsync(a => a.CourseId == courseId && a.ClassroomId == classroomId && a.RemovedAt == null, context.RequestAborted);
         if (assignment is null) return Failure(context, "course_assignment_not_found", "Active course assignment was not found.", ErrorType.NotFound);
+        var affectedStudentIds = await db.ClassroomMemberships
+            .Where(membership => membership.ClassroomId == classroomId && membership.LeftAt == null)
+            .Select(membership => membership.StudentId)
+            .ToListAsync(context.RequestAborted);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
         assignment.RemovedAt = timeProvider.GetUtcNow();
         await db.SaveChangesAsync(context.RequestAborted);
+        foreach (var studentId in affectedStudentIds)
+        {
+            await LearningAccess.DeleteIncompleteAttemptsWithoutCourseAccess(
+                db, studentId, [courseId], context.RequestAborted);
+        }
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 
