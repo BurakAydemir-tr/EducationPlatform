@@ -170,6 +170,8 @@ ASP.NET Core Identity şu ihtiyaçlar için kullanılacaktır:
 
 Kullanıcı persistence modeli `ApplicationUser : IdentityUser<Guid>` olacaktır. MVP’de bunun karşılığında Domain projesinde ayrı bir User modeli veya aggregate’i oluşturulmayacaktır.
 
+İlk Teacher hesabı, isteğe bağlı `SeedData:Teacher` configuration değerleriyle ASP.NET Core Identity üzerinden idempotent olarak oluşturulabilir. Kullanıcı adı, ad ve parola birlikte verilmelidir. Parola yalnızca User Secrets, environment variable veya deployment secret üzerinden sağlanmalı; source code, migration veya `appsettings*.json` içine yazılmamalıdır. Configuration bulunmadığında varsayılan kullanıcı veya parola oluşturulmaz.
+
 Authentication, cookie yerine JWT kullanacaktır. JWT yapısı kısa ömürlü access token ve daha uzun ömürlü refresh token yaklaşımından oluşacaktır.
 
 Refresh token:

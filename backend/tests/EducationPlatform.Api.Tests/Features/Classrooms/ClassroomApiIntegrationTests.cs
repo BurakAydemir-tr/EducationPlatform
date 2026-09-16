@@ -7,6 +7,7 @@ using EducationPlatform.Api.Features.Classrooms;
 using EducationPlatform.Api.Features.Students;
 using EducationPlatform.Api.Persistence;
 using EducationPlatform.Api.Persistence.Identity;
+using EducationPlatform.Api.Persistence.SeedData;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -32,6 +33,10 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
     public async Task Teacher_CanCreateClassroomAddAndRemoveStudent_WithAuthorizationRules()
     {
         using var teacherClient = await CreateAuthenticatedClient("teacher-one");
+        var invalidClassroom = await teacherClient.PostAsJsonAsync(
+            "/api/classrooms", new CreateClassroomRequest(new string('x', 201)));
+        Assert.Equal(HttpStatusCode.BadRequest, invalidClassroom.StatusCode);
+        await AssertProblemCodeAsync(invalidClassroom, "invalid_classroom");
         var createStudentResponse = await teacherClient.PostAsJsonAsync(
             "/api/students",
             new CreateStudentRequest("student-created", "Student Created", Password, "STU-NEW"));
@@ -90,6 +95,13 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
             new AddStudentRequest("student-created"));
         Assert.Equal(HttpStatusCode.NoContent, addResponse.StatusCode);
 
+        var classrooms = await teacherClient.GetFromJsonAsync<List<ClassroomSummaryResponse>>("/api/classrooms");
+        Assert.Contains(classrooms!, item => item.Id == classroom.Id && item.ActiveStudentCount == 1);
+        var classroomDetail = await teacherClient.GetFromJsonAsync<ClassroomDetailResponse>($"/api/classrooms/{classroom.Id}");
+        Assert.Equal("6-A", classroomDetail!.Name);
+        var activeStudents = await teacherClient.GetFromJsonAsync<List<ClassroomStudentResponse>>($"/api/classrooms/{classroom.Id}/students");
+        Assert.Equal(createdStudent.Id, Assert.Single(activeStudents!).StudentId);
+
         var duplicateResponse = await teacherClient.PostAsJsonAsync(
             $"/api/classrooms/{classroom.Id}/students",
             new AddStudentRequest("STU-NEW"));
@@ -121,6 +133,9 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
             $"/api/classrooms/{classroom.Id}/students/{studentId}");
         Assert.Equal(HttpStatusCode.Forbidden, forbiddenRemoveResponse.StatusCode);
         await AssertProblemCodeAsync(forbiddenRemoveResponse, "forbidden");
+        Assert.Equal(HttpStatusCode.Forbidden, (await otherTeacherClient.GetAsync($"/api/classrooms/{classroom.Id}")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await otherTeacherClient.GetAsync($"/api/classrooms/{classroom.Id}/students")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await studentClient.GetAsync("/api/classrooms")).StatusCode);
 
         var removeResponse = await teacherClient.DeleteAsync(
             $"/api/classrooms/{classroom.Id}/students/{studentId}");
@@ -145,7 +160,95 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
         Assert.Single(memberships, membership => membership.LeftAt is not null);
         Assert.Single(memberships, membership => membership.LeftAt is null);
 
+        activeStudents = await teacherClient.GetFromJsonAsync<List<ClassroomStudentResponse>>($"/api/classrooms/{classroom.Id}/students");
+        Assert.Single(activeStudents!);
+
         await AssertRefreshTokenRotationAsync();
+    }
+
+    [Fact]
+    public async Task AuthenticationRejectsInvalidExpiredAndRevokedCredentials()
+    {
+        using var client = CreateHttpsClient();
+        var invalid = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-one", "wrong-password"));
+        Assert.Equal(HttpStatusCode.Unauthorized, invalid.StatusCode);
+        await AssertProblemCodeAsync(invalid, "invalid_credentials");
+
+        var expiredValue = "expired-refresh-token";
+        var revokedValue = "revoked-refresh-token";
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+            var userId = await db.Users.Where(user => user.UserName == "teacher-one").Select(user => user.Id).SingleAsync();
+            db.RefreshTokens.AddRange(
+                new RefreshToken { Id = Guid.NewGuid(), UserId = userId, TokenHash = TokenService.HashRefreshToken(expiredValue), ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1) },
+                new RefreshToken { Id = Guid.NewGuid(), UserId = userId, TokenHash = TokenService.HashRefreshToken(revokedValue), ExpiresAt = DateTimeOffset.UtcNow.AddHours(1), RevokedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+        }
+
+        foreach (var token in new[] { expiredValue, revokedValue })
+        {
+            var response = await client.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(token));
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+            await AssertProblemCodeAsync(response, "invalid_refresh_token");
+        }
+    }
+
+    [Fact]
+    public async Task TeacherSeedData_IsIdempotent_AndDoesNotCreateDefaultsWhenMissing()
+    {
+        var missing = new ConfigurationBuilder().AddInMemoryCollection().Build();
+        await TeacherSeedData.InitializeAsync(_factory!.Services, missing);
+
+        const string seedUserName = "seed-teacher";
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["SeedData:Teacher:UserName"] = seedUserName,
+            ["SeedData:Teacher:Name"] = "Seed Teacher",
+            ["SeedData:Teacher:Password"] = Password
+        }).Build();
+        await TeacherSeedData.InitializeAsync(_factory.Services, configuration);
+        await TeacherSeedData.InitializeAsync(_factory.Services, configuration);
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        var seeded = await users.FindByNameAsync(seedUserName);
+        Assert.NotNull(seeded);
+        Assert.True(await users.IsInRoleAsync(seeded!, RoleNames.Teacher));
+        Assert.Single(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().Users
+            .Where(user => user.NormalizedUserName == seedUserName.ToUpperInvariant()).ToListAsync());
+    }
+
+    [Fact]
+    public async Task TeacherSeedData_RejectsPartialConfigurationAndExistingStudent()
+    {
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        var initialCount = await db.Users.CountAsync();
+
+        var partial = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["SeedData:Teacher:UserName"] = "partial-teacher"
+        }).Build();
+        var partialError = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => TeacherSeedData.InitializeAsync(_factory.Services, partial));
+        Assert.Contains("UserName, Name and Password together", partialError.Message);
+        Assert.Equal(initialCount, await db.Users.CountAsync());
+
+        var existingStudent = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["SeedData:Teacher:UserName"] = "student-one",
+            ["SeedData:Teacher:Name"] = "Student One",
+            ["SeedData:Teacher:Password"] = Password
+        }).Build();
+        var roleError = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => TeacherSeedData.InitializeAsync(_factory.Services, existingStudent));
+        Assert.Contains("without the Teacher role", roleError.Message);
+        var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        var student = await users.FindByNameAsync("student-one");
+        Assert.NotNull(student);
+        Assert.False(await users.IsInRoleAsync(student!, RoleNames.Teacher));
+        Assert.Equal(initialCount, await db.Users.CountAsync());
     }
 
     public async Task InitializeAsync()

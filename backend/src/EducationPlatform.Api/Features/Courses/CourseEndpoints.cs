@@ -45,7 +45,8 @@ public static class CourseEndpoints
     private static async Task<IResult> CreateAsync(CreateCourseRequest request, HttpContext context, EducationPlatformDbContext db)
     {
         if (!CurrentUser.TryGetId(context.User, out var teacherId)) return Authentication(context);
-        if (string.IsNullOrWhiteSpace(request.Title)) return Failure(context, "course_title_required", "Course title is required.", ErrorType.Validation);
+        var validation = ValidateCourse(request.Title, request.Description);
+        if (validation is not null) return InvalidRequest(context, validation);
         var course = new Course(Guid.NewGuid(), request.Title, request.Description, teacherId);
         db.Courses.Add(course);
         await db.SaveChangesAsync(context.RequestAborted);
@@ -72,6 +73,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddWeekAsync(Guid courseId, AddWeekRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateRequired(request.Title, 200, "Week title");
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         CourseWeek week;
@@ -88,6 +91,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddPublishedWeekWithTopicAsync(Guid courseId, AddPublishedWeekWithTopicRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateWeekAndTopic(request.WeekTitle, request.ContentTitle, request.Text);
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         CourseWeek week;
@@ -106,6 +111,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddPublishedWeekWithVideoAsync(Guid courseId, AddPublishedWeekWithVideoRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateWeekAndVideo(request.WeekTitle, request.ContentTitle, request.VideoUrl, request.Description);
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         CourseWeek week;
@@ -124,6 +131,10 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddPublishedWeekWithQuizAsync(Guid courseId, AddPublishedWeekWithQuizRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateRequired(request.WeekTitle, 200, "Week title")
+            ?? ValidateRequired(request.ContentTitle, 200, "Content title");
+        if (validation is not null || request.QuizId == Guid.Empty)
+            return InvalidRequest(context, validation ?? "Quiz identifier is required.");
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         var quizFailure = await ValidateAssignableQuizAsync(loaded.Course!, request.QuizId, context, db);
@@ -151,6 +162,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddTopicAsync(Guid courseId, Guid weekId, AddTopicRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateTopic(request.Title, request.Text);
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         WeekContent content;
@@ -167,6 +180,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddVideoAsync(Guid courseId, Guid weekId, AddVideoRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateVideo(request.Title, request.VideoUrl, request.Description);
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         WeekContent content;
@@ -183,6 +198,9 @@ public static class CourseEndpoints
 
     private static async Task<IResult> AddQuizAsync(Guid courseId, Guid weekId, AddQuizContentRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateRequired(request.Title, 200, "Content title");
+        if (validation is not null || request.QuizId == Guid.Empty)
+            return InvalidRequest(context, validation ?? "Quiz identifier is required.");
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         var quiz = await db.Quizzes.AsNoTracking()
@@ -267,6 +285,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> UpdateTopicAsync(Guid courseId, Guid weekId, Guid contentId, UpdateTopicRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateTopic(request.Title, request.Text);
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         try { loaded.Course!.UpdateTopic(weekId, contentId, request.Title, request.Text); }
@@ -277,6 +297,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> UpdateVideoAsync(Guid courseId, Guid weekId, Guid contentId, UpdateVideoRequest request, HttpContext context, EducationPlatformDbContext db)
     {
+        var validation = ValidateVideo(request.Title, request.VideoUrl, request.Description);
+        if (validation is not null) return InvalidRequest(context, validation);
         var loaded = await LoadOwnedCourse(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         try { loaded.Course!.UpdateVideo(weekId, contentId, request.Title, request.VideoUrl, request.Description); }
@@ -427,7 +449,40 @@ public static class CourseEndpoints
     private static IResult QuizAlreadyAssigned(HttpContext context) => Failure(context, "quiz_already_assigned", "Quiz is already assigned to content.", ErrorType.Conflict);
     private static IResult InvalidOrder(HttpContext context, string detail) => Failure(context, "invalid_order", detail, ErrorType.Validation);
     private static IResult InvalidOperation(HttpContext context, string detail) => Failure(context, "invalid_operation", detail, ErrorType.Validation);
+    private static IResult InvalidRequest(HttpContext context, string detail) => Failure(context, "invalid_request", detail, ErrorType.Validation);
     private static IResult Failure(HttpContext context, string code, string detail, ErrorType type) => Result.Failure(new Error(code, detail, type)).ToHttpResult(context);
+
+    private static string? ValidateCourse(string title, string? description) =>
+        ValidateRequired(title, 200, "Course title") ?? ValidateOptional(description, 2000, "Course description");
+
+    private static string? ValidateWeekAndTopic(string weekTitle, string contentTitle, string text) =>
+        ValidateRequired(weekTitle, 200, "Week title") ?? ValidateTopic(contentTitle, text);
+
+    private static string? ValidateWeekAndVideo(string weekTitle, string contentTitle, string url, string? description) =>
+        ValidateRequired(weekTitle, 200, "Week title") ?? ValidateVideo(contentTitle, url, description);
+
+    private static string? ValidateTopic(string title, string text) =>
+        ValidateRequired(title, 200, "Content title") ?? ValidateRequired(text, 20000, "Topic text");
+
+    private static string? ValidateVideo(string title, string url, string? description)
+    {
+        var error = ValidateRequired(title, 200, "Content title")
+            ?? ValidateRequired(url, 2000, "Video URL")
+            ?? ValidateOptional(description, 2000, "Video description");
+        if (error is not null) return error;
+        return Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            ? null
+            : "Video URL must be an absolute HTTP or HTTPS URL.";
+    }
+
+    private static string? ValidateRequired(string? value, int maxLength, string field) =>
+        string.IsNullOrWhiteSpace(value) ? $"{field} is required."
+        : value.Trim().Length > maxLength ? $"{field} cannot exceed {maxLength} characters."
+        : null;
+
+    private static string? ValidateOptional(string? value, int maxLength, string field) =>
+        value is not null && value.Trim().Length > maxLength ? $"{field} cannot exceed {maxLength} characters." : null;
 }
 
 public sealed record CreateCourseRequest(string Title, string? Description);

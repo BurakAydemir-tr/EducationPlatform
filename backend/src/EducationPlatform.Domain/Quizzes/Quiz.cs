@@ -41,6 +41,35 @@ public sealed class Quiz
         return question.AddOption(id, text, order, isCorrect);
     }
 
+    public void Update(string title, IReadOnlyList<QuizQuestionDefinition> questions)
+    {
+        EnsureUnlocked();
+        ArgumentException.ThrowIfNullOrWhiteSpace(title);
+        ArgumentNullException.ThrowIfNull(questions);
+        if (questions.Count == 0)
+            throw new InvalidOperationException("Quiz must contain at least one question.");
+
+        var replacements = new List<Question>(questions.Count);
+        foreach (var definition in questions.OrderBy(item => item.Order))
+        {
+            ArgumentNullException.ThrowIfNull(definition.Options);
+            if (definition.Order <= 0 || replacements.Any(item => item.Order == definition.Order))
+                throw new InvalidOperationException("Question order must be positive and unique.");
+
+            var question = new Question(Guid.NewGuid(), definition.Text, definition.Order);
+            foreach (var option in definition.Options.OrderBy(item => item.Order))
+                question.AddOption(Guid.NewGuid(), option.Text, option.Order, option.IsCorrect);
+
+            if (!question.IsValid)
+                throw new InvalidOperationException("Every question must have at least two options with exactly one correct option.");
+            replacements.Add(question);
+        }
+
+        Title = title.Trim();
+        _questions.Clear();
+        _questions.AddRange(replacements);
+    }
+
     public bool IsValid => _questions.Count > 0 && _questions.All(question => question.IsValid);
 
     public void Lock() => IsLocked = true;
@@ -50,6 +79,13 @@ public sealed class Quiz
         if (IsLocked) throw new InvalidOperationException("Quiz is locked.");
     }
 }
+
+public sealed record QuizQuestionDefinition(
+    string Text,
+    int Order,
+    IReadOnlyList<QuizOptionDefinition> Options);
+
+public sealed record QuizOptionDefinition(string Text, int Order, bool IsCorrect);
 
 public sealed class Question
 {

@@ -19,12 +19,14 @@ Teacher:
 
 - Sisteme giriş yapabilir.
 - Classroom oluşturabilir ve yalnızca kendi Classroom’larını yönetebilir.
+- Kendi Classroom listesini, Classroom detayını ve aktif öğrenci listesini görüntüleyebilir.
 - Benzersiz kullanıcı adıyla Student hesabı oluşturabilir.
 - Mevcut bir Student’ı kullanıcı adı veya öğrenci koduyla bulup Classroom’a ekleyebilir.
 - Student’ı Classroom’dan çıkarabilir.
 - Course oluşturabilir ve `Draft` olarak hazırlayabilir.
 - Course’a hafta ekleyebilir.
 - Haftalara Topic, Video ve Quiz içerikleri ekleyebilir.
+- Kendi Quiz’lerini görüntüleyebilir ve ilk QuizAttempt başlamadan önce düzenleyebilir.
 - Hafta ve WeekContent sıralarını değiştirebilir.
 - Course’u bir veya birden fazla kendi Classroom’una atayabilir ya da atamasını kaldırabilir.
 - Geçerli bir Draft Course’u `Published` yapabilir.
@@ -95,6 +97,7 @@ Student:
 - Aynı Student aynı Classroom’a ikinci kez eklenememelidir.
 - Student aynı anda birden fazla Classroom’da bulunabilmelidir.
 - Teacher Student’ı Classroom’dan çıkarabilmelidir.
+- Teacher kendi Classroom’larını, Classroom detayını ve aktif öğrenci listesini görüntüleyebilmelidir.
 
 ### Course ve içerik
 
@@ -117,6 +120,7 @@ Student:
 - Puan, verilen cevaplardan sistem tarafından hesaplanmalıdır.
 - Student aynı Quiz için sınırsız sayıda QuizAttempt başlatabilmelidir.
 - İlk QuizAttempt başladıktan sonra ilgili Quiz değiştirilememelidir.
+- Teacher yalnızca kendisine ait ve henüz kilitlenmemiş Quiz’i görüntüleyip düzenleyebilmelidir.
 - Tamamlanan QuizAttempt sonradan değiştirilememelidir.
 
 ### İlerleme ve raporlama
@@ -132,7 +136,7 @@ Student:
 - Draft Course Student tarafından görüntülenememelidir.
 - Published Course yalnızca atandığı Classroom’lardan en az birine aktif üyeliği bulunan Student tarafından görüntülenebilmelidir.
 - Classroom veya Course ataması üzerinden erişim kaldırıldığında yeni erişim sona ermelidir.
-- Erişim kaybı geçmiş ContentProgress ve QuizAttempt kayıtlarını silmemelidir.
+- Erişim kaybında ContentProgress ve tamamlanmış QuizAttempt geçmişi korunmalıdır. Student’ın Course’a son aktif erişimi de sona erdiğinde o Course kapsamındaki tamamlanmamış QuizAttempt kayıtları silinmelidir.
 
 ## 7. Kabul kriterleri
 
@@ -189,8 +193,8 @@ Student:
 
 ### Erişim kaybı ve geçmiş veriler
 
-- Student Classroom’dan çıkarıldığında geçmiş ContentProgress ve QuizAttempt kayıtları korunmalıdır.
-- Course Classroom’dan kaldırıldığında geçmiş ContentProgress ve QuizAttempt kayıtları korunmalıdır.
+- Student Classroom’dan çıkarıldığında ContentProgress ve tamamlanmış QuizAttempt geçmişi korunmalıdır; Course’a son aktif erişimi de sona ererse tamamlanmamış QuizAttempt kayıtları silinmelidir.
+- Course Classroom’dan kaldırıldığında ContentProgress ve tamamlanmış QuizAttempt geçmişi korunmalıdır; Student’ın Course’a son aktif erişimi de sona ererse tamamlanmamış QuizAttempt kayıtları silinmelidir.
 - Student aynı Course’a başka bir aktif Classroom üzerinden erişiyorsa erişimi devam etmelidir.
 - Student tüm erişimini kaybettiğinde yeni içerik görüntüleyememeli veya yeni QuizAttempt başlatamamalıdır.
 - Erişim kaybından sonra Teacher’ın geçmiş ilerleme ve Quiz sonuçlarını görüntüleyebilmesi sürmelidir.
@@ -231,5 +235,5 @@ MVP aşağıdaki kullanıcı sonuçlarının tamamı sağlandığında tamamlanm
 - Student Topic ve Video içeriklerini tamamlayabilir, Quiz çözebilir, sonucunu görebilir ve Quiz’i tekrar çözebilir.
 - Student kendi hafta ve ders ilerlemesini güncel içeriklere göre görebilir.
 - Teacher öğrencilerin ilerlemesini ve Quiz bazında deneme sayısı, ilk puan, son puan ve en iyi puanını görebilir.
-- Student’ın Classroom üyeliği veya Course erişimi kaldırıldığında yeni erişim sona erer; geçmiş ilerleme ve Quiz sonuçları korunur.
+- Student’ın Classroom üyeliği veya Course erişimi kaldırıldığında yeni erişim sona erer; ContentProgress ve tamamlanmış QuizAttempt geçmişi korunur, son aktif Course erişimi kaybolduğunda tamamlanmamış QuizAttempt silinir.
 - Temel Teacher ve Student akışları, MVP dışında bırakılan özelliklere ihtiyaç duymadan baştan sona tamamlanabilir.

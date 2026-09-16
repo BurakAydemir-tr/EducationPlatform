@@ -10,6 +10,7 @@ using EducationPlatform.Api.Features.Quizzes;
 using EducationPlatform.Api.Features.Students;
 using EducationPlatform.Api.Persistence;
 using EducationPlatform.Api.Persistence.Identity;
+using EducationPlatform.Api.Persistence.SeedData;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
@@ -102,6 +103,8 @@ builder.Services
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
+
+await TeacherSeedData.InitializeAsync(app.Services, app.Configuration);
 
 app.UseExceptionHandler();
 app.UseHttpsRedirection();

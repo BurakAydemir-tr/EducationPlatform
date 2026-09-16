@@ -32,6 +32,11 @@ public static class AuthEndpoints
                 "The username or password is invalid.",
                 ErrorType.Authentication)).ToHttpResult(httpContext);
         }
+        if (request.UserName.Trim().Length > 256)
+        {
+            return Result<LoginResponse>.Failure(new Error(
+                "invalid_credentials", "The username or password is invalid.", ErrorType.Authentication)).ToHttpResult(httpContext);
+        }
 
         var user = await userManager.FindByNameAsync(request.UserName.Trim());
         if (user is null)
@@ -83,6 +88,7 @@ public static class AuthEndpoints
         {
             return InvalidRefreshToken(httpContext);
         }
+        if (request.RefreshToken.Length > 2048) return InvalidRefreshToken(httpContext);
 
         var hash = TokenService.HashRefreshToken(request.RefreshToken);
         var storedToken = await dbContext.RefreshTokens

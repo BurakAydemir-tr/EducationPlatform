@@ -40,6 +40,11 @@ public static class StudentEndpoints
             ? null
             : userManager.NormalizeName(studentCode);
 
+        if (userName.Length > 256 || name.Length > 500)
+        {
+            return ValidationFailure(httpContext, "Username cannot exceed 256 characters and name cannot exceed 500 characters.");
+        }
+
         if (studentCode is not null && studentCode.Length > 64)
         {
             return ValidationFailure(httpContext, "Student code cannot exceed 64 characters.");

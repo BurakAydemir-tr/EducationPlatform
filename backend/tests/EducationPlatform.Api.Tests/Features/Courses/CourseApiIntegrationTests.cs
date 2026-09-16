@@ -40,6 +40,31 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         using var otherTeacher = await AuthenticatedClient("other-teacher");
         using var student = await AuthenticatedClient("course-student");
 
+        var invalidCourse = await teacher.PostAsJsonAsync("/api/courses", new CreateCourseRequest(new string('x', 201), null));
+        Assert.Equal(HttpStatusCode.BadRequest, invalidCourse.StatusCode);
+        await AssertProblemCode(invalidCourse, "invalid_request");
+        var invalidQuiz = await teacher.PostAsJsonAsync("/api/quizzes", new CreateQuizRequest(new string('x', 201),
+        [new CreateQuestionRequest("Question", 1, [new CreateOptionRequest("Yes", 1, true), new CreateOptionRequest("No", 2, false)])]));
+        Assert.Equal(HttpStatusCode.BadRequest, invalidQuiz.StatusCode);
+        await AssertProblemCode(invalidQuiz, "invalid_quiz");
+        var nullQuestion = await teacher.PostAsJsonAsync("/api/quizzes", new
+        {
+            title = "Null question",
+            questions = new object?[] { null }
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, nullQuestion.StatusCode);
+        await AssertProblemCode(nullQuestion, "invalid_quiz");
+        var nullOption = await teacher.PostAsJsonAsync("/api/quizzes", new
+        {
+            title = "Null option",
+            questions = new[]
+            {
+                new { text = "Question", order = 1, options = new object?[] { null, new { text = "Correct", order = 2, isCorrect = true } } }
+            }
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, nullOption.StatusCode);
+        await AssertProblemCode(nullOption, "invalid_quiz");
+
         var studentForbidden = await student.PostAsJsonAsync("/api/courses", new CreateCourseRequest("Forbidden", null));
         Assert.Equal(HttpStatusCode.Forbidden, studentForbidden.StatusCode);
         await AssertProblemCode(studentForbidden, "forbidden");
@@ -92,6 +117,22 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         ]));
         var quiz = await quizResponse.Content.ReadFromJsonAsync<CreateQuizResponse>();
         Assert.Equal(HttpStatusCode.Created, quizResponse.StatusCode);
+
+        var quizDetail = await teacher.GetFromJsonAsync<QuizDetailResponse>($"/api/quizzes/{quiz!.Id}");
+        Assert.Equal("Mini quiz", quizDetail!.Title);
+        Assert.True(Assert.Single(quizDetail.Questions).Options.Single(option => option.Order == 1).IsCorrect);
+        var quizUpdate = await teacher.PutAsJsonAsync($"/api/quizzes/{quiz.Id}", new UpdateQuizRequest("Mini quiz updated",
+        [
+            new CreateQuestionRequest("Updated question?", 1,
+            [
+                new CreateOptionRequest("Correct", 1, true),
+                new CreateOptionRequest("Wrong", 2, false)
+            ])
+        ]));
+        Assert.Equal(HttpStatusCode.NoContent, quizUpdate.StatusCode);
+        Assert.Equal("Mini quiz updated", (await teacher.GetFromJsonAsync<QuizDetailResponse>($"/api/quizzes/{quiz.Id}"))!.Title);
+        Assert.Equal(HttpStatusCode.Forbidden, (await otherTeacher.GetAsync($"/api/quizzes/{quiz.Id}")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await student.GetAsync($"/api/quizzes/{quiz.Id}")).StatusCode);
 
         var quizContent = await teacher.PostAsJsonAsync($"/api/courses/{course.Id}/weeks/{week.Id}/contents/quiz", new AddQuizContentRequest("Test", 3, quiz!.Id));
         var quizWeekContent = await quizContent.Content.ReadFromJsonAsync<WeekContentResponse>();
@@ -147,6 +188,12 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         Assert.Equal(3, detail.Weeks.Single(item => item.Id == week.Id).Contents.Count);
         Assert.Equal([quizWeekContent.Id, topic.Id, video.Id], detail.Weeks.Single(item => item.Id == week.Id).Contents.Select(item => item.Id));
         var atomicContent = detail.Weeks.Single(item => item.Id == atomicWeek.Id).Contents.Single();
+        var reorderWeeks = await teacher.PutAsJsonAsync(
+            $"/api/courses/{course.Id}/weeks/order", new ReorderRequest([atomicWeek.Id, week.Id]));
+        Assert.Equal(HttpStatusCode.NoContent, reorderWeeks.StatusCode);
+        detail = await student.GetFromJsonAsync<CourseDetailResponse>($"/api/student/courses/{course.Id}");
+        Assert.Equal([atomicWeek.Id, week.Id], detail!.Weeks.Select(item => item.Id));
+
         var deactivateLast = await teacher.DeleteAsync($"/api/courses/{course.Id}/weeks/{atomicWeek.Id}/contents/{atomicContent.Id}");
         Assert.Equal(HttpStatusCode.BadRequest, deactivateLast.StatusCode);
         await AssertProblemCode(deactivateLast, "invalid_operation");
@@ -155,6 +202,15 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.NoContent, update.StatusCode);
         detail = await student.GetFromJsonAsync<CourseDetailResponse>($"/api/student/courses/{course.Id}");
         Assert.Equal("Yeni metin", detail!.Weeks.Single(item => item.Id == week.Id).Contents.Single(item => item.Id == topic.Id).TopicText);
+
+        var updateVideo = await teacher.PutAsJsonAsync(
+            $"/api/courses/{course.Id}/weeks/{week.Id}/contents/{video.Id}/video",
+            new UpdateVideoRequest("Video güncel", "https://example.com/updated-video", "Güncel açıklama"));
+        Assert.Equal(HttpStatusCode.NoContent, updateVideo.StatusCode);
+        detail = await student.GetFromJsonAsync<CourseDetailResponse>($"/api/student/courses/{course.Id}");
+        var updatedVideo = detail!.Weeks.Single(item => item.Id == week.Id).Contents.Single(item => item.Id == video.Id);
+        Assert.Equal("https://example.com/updated-video", updatedVideo.VideoUrl);
+        Assert.Equal("Güncel açıklama", updatedVideo.VideoDescription);
 
         var deactivate = await teacher.DeleteAsync($"/api/courses/{course.Id}/weeks/{week.Id}/contents/{video.Id}");
         Assert.Equal(HttpStatusCode.NoContent, deactivate.StatusCode);
@@ -243,6 +299,19 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         }
 
         var first = await Start();
+        var lockedUpdate = await teacher.PutAsJsonAsync($"/api/quizzes/{setup.QuizId}", new UpdateQuizRequest("Locked",
+        [
+            new CreateQuestionRequest("Changed", 1,
+            [new CreateOptionRequest("Yes", 1, true), new CreateOptionRequest("No", 2, false)])
+        ]));
+        Assert.Equal(HttpStatusCode.Conflict, lockedUpdate.StatusCode);
+        await AssertProblemCode(lockedUpdate, "quiz_locked");
+        var nullAnswer = await student.PostAsJsonAsync($"/api/student/quiz-attempts/{first.AttemptId}/complete", new
+        {
+            answers = new object?[] { null }
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, nullAnswer.StatusCode);
+        await AssertProblemCode(nullAnswer, "invalid_quiz_answers");
         var correct = first.Question.Options.Single(option => option.Order == 1);
         var invalidComplete = await student.PostAsJsonAsync($"/api/student/quiz-attempts/{first.AttemptId}/complete",
             new CompleteQuizAttemptRequest([new QuizAnswerRequest(first.Question.Id, Guid.NewGuid())]));
@@ -267,6 +336,23 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         Assert.Equal(100m, progress.Percentage);
         var teacherProgress = await teacher.GetFromJsonAsync<CourseProgressResponse>($"/api/courses/{setup.CourseId}/students/{studentId}/progress");
         Assert.Equal(100m, teacherProgress!.Percentage);
+
+        var addedContent = await teacher.PostAsJsonAsync(
+            $"/api/courses/{setup.CourseId}/weeks/{progress.Weeks.Single().WeekId}/contents/topic",
+            new AddTopicRequest("New active topic", 3, "New text"));
+        Assert.Equal(HttpStatusCode.Created, addedContent.StatusCode);
+        progress = await student.GetFromJsonAsync<CourseProgressResponse>($"/api/student/courses/{setup.CourseId}/progress");
+        Assert.Equal(2, progress!.CompletedContentCount);
+        Assert.Equal(3, progress.TotalContentCount);
+        Assert.Equal(200m / 3m, progress.Percentage);
+
+        using var otherTeacher = await AuthenticatedClient("other-teacher");
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await otherTeacher.GetAsync($"/api/courses/{setup.CourseId}/students/{studentId}/progress")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await otherTeacher.GetAsync($"/api/courses/{setup.CourseId}/students/{studentId}/quiz-results")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await student.GetAsync($"/api/courses/{setup.CourseId}/students/{studentId}/progress")).StatusCode);
 
         var directQuizCompletion = await student.PostAsync($"/api/student/contents/{setup.QuizContentId}/complete", null);
         Assert.Equal(HttpStatusCode.BadRequest, directQuizCompletion.StatusCode);
@@ -298,11 +384,14 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.NotFound, cannotStart.StatusCode);
         var preservedResult = await student.GetAsync($"/api/student/quiz-attempts/{first.AttemptId}");
         Assert.Equal(HttpStatusCode.OK, preservedResult.StatusCode);
+        using var otherStudent = await AuthenticatedClient("other-student");
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await otherStudent.GetAsync($"/api/student/quiz-attempts/{first.AttemptId}")).StatusCode);
 
         report = await teacher.GetFromJsonAsync<List<TeacherQuizResultResponse>>($"/api/courses/{setup.CourseId}/students/{studentId}/quiz-results");
         Assert.Equal(2, Assert.Single(report!).AttemptCount);
         teacherProgress = await teacher.GetFromJsonAsync<CourseProgressResponse>($"/api/courses/{setup.CourseId}/students/{studentId}/progress");
-        Assert.Equal(100m, teacherProgress!.Percentage);
+        Assert.Equal(200m / 3m, teacherProgress!.Percentage);
     }
 
     [Fact]
@@ -451,7 +540,7 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
     private static async Task Seed(IServiceProvider services)
     {
         var users = services.GetRequiredService<UserManager<ApplicationUser>>();
-        foreach (var (name, role) in new[] { ("course-teacher", RoleNames.Teacher), ("other-teacher", RoleNames.Teacher), ("course-student", RoleNames.Student) })
+        foreach (var (name, role) in new[] { ("course-teacher", RoleNames.Teacher), ("other-teacher", RoleNames.Teacher), ("course-student", RoleNames.Student), ("other-student", RoleNames.Student) })
         {
             var user = new ApplicationUser { Id = Guid.NewGuid(), UserName = name, Name = name };
             Assert.True((await users.CreateAsync(user, Password)).Succeeded);

@@ -333,6 +333,7 @@ Classroom–Student ve Course–Classroom çoktan çoğa ilişkileri persistence
 - MVP’de yalnızca tek doğru cevaplı çoktan seçmeli sorular desteklenir.
 - Option sırası Question içinde benzersiz olmalıdır.
 - Quiz’e ilk QuizAttempt başladıktan sonra Quiz değiştirilemez.
+- Quiz sahibi öğretmen, ilk QuizAttempt başlamadan önce Quiz başlığını, sorularını, seçeneklerini, doğru cevaplarını ve sırasını Quiz aggregate’i üzerinden birlikte düzenleyebilir.
 - Kilitlenen Quiz üzerinde soru metni, seçenek, doğru cevap ve soru sırası değiştirilemez.
 - Değişiklik gerektiğinde yeni bir Quiz oluşturulur ve ilgili WeekContent yeni `QuizId` değerine yönlendirilir.
 - Eski Quiz ve ona bağlı QuizAttempt kayıtları korunur.

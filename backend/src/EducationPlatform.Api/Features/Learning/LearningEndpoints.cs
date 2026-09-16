@@ -209,15 +209,16 @@ public static class LearningEndpoints
         return related ? null : Failure(context, "student_not_in_course_context", "Student is not in this course context.", ErrorType.NotFound);
     }
 
-    private static bool TryEvaluate(Quiz quiz, IReadOnlyList<QuizAnswerRequest>? answers, out IReadOnlyCollection<QuizAttemptAnswerSelection>? selections, out int correctCount, out string? error)
+    private static bool TryEvaluate(Quiz quiz, IReadOnlyList<QuizAnswerRequest?>? answers, out IReadOnlyCollection<QuizAttemptAnswerSelection>? selections, out int correctCount, out string? error)
     {
         selections = null; correctCount = 0; error = null;
-        if (answers is null || answers.Count != quiz.Questions.Count || answers.Select(item => item.QuestionId).Distinct().Count() != answers.Count)
+        if (answers is null || answers.Any(item => item is null) || answers.Count != quiz.Questions.Count
+            || answers.Select(item => item!.QuestionId).Distinct().Count() != answers.Count)
         { error = "Every question must have exactly one answer."; return false; }
         var result = new List<QuizAttemptAnswerSelection>();
         foreach (var question in quiz.Questions)
         {
-            var submitted = answers.SingleOrDefault(item => item.QuestionId == question.Id);
+            var submitted = answers.SingleOrDefault(item => item!.QuestionId == question.Id);
             if (submitted is null) { error = "Every question must have exactly one answer."; return false; }
             var option = question.Options.SingleOrDefault(item => item.Id == submitted.SelectedOptionId);
             if (option is null) { error = "Selected option does not belong to the question."; return false; }
@@ -238,7 +239,7 @@ public static class LearningEndpoints
 public sealed record StartQuizAttemptResponse(Guid AttemptId, DateTimeOffset StartedAt, string QuizTitle, IReadOnlyList<QuizQuestionResponse> Questions);
 public sealed record QuizQuestionResponse(Guid Id, string Text, int Order, IReadOnlyList<QuizOptionResponse> Options);
 public sealed record QuizOptionResponse(Guid Id, string Text, int Order);
-public sealed record CompleteQuizAttemptRequest(IReadOnlyList<QuizAnswerRequest>? Answers);
+public sealed record CompleteQuizAttemptRequest(IReadOnlyList<QuizAnswerRequest?>? Answers);
 public sealed record QuizAnswerRequest(Guid QuestionId, Guid SelectedOptionId);
 public sealed record QuizAttemptResultResponse(Guid AttemptId, Guid QuizId, DateTimeOffset StartedAt, DateTimeOffset CompletedAt, int CorrectAnswerCount, int QuestionCount, decimal Score);
 public sealed record CourseProgressResponse(Guid CourseId, int CompletedContentCount, int TotalContentCount, decimal Percentage, IReadOnlyList<WeekProgressResponse> Weeks);

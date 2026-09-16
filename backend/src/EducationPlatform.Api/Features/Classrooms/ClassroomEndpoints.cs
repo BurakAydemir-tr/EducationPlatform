@@ -19,9 +19,61 @@ public static class ClassroomEndpoints
             .RequireAuthorization(policy => policy.RequireRole(RoleNames.Teacher));
 
         group.MapPost("/", CreateAsync);
+        group.MapGet("/", ListAsync);
+        group.MapGet("/{classroomId:guid}", GetAsync);
+        group.MapGet("/{classroomId:guid}/students", ListStudentsAsync);
         group.MapPost("/{classroomId:guid}/students", AddStudentAsync);
         group.MapDelete("/{classroomId:guid}/students/{studentId:guid}", RemoveStudentAsync);
         return endpoints;
+    }
+
+    private static async Task<IResult> ListAsync(HttpContext context, EducationPlatformDbContext db)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var teacherId)) return AuthenticationFailure(context);
+        var classrooms = await db.Classrooms.AsNoTracking()
+            .Where(item => item.TeacherId == teacherId)
+            .OrderBy(item => item.Name)
+            .Select(item => new ClassroomSummaryResponse(
+                item.Id,
+                item.Name,
+                db.ClassroomMemberships.Count(membership => membership.ClassroomId == item.Id && membership.LeftAt == null)))
+            .ToListAsync(context.RequestAborted);
+        return Results.Ok(classrooms);
+    }
+
+    private static async Task<IResult> GetAsync(Guid classroomId, HttpContext context, EducationPlatformDbContext db)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var teacherId)) return AuthenticationFailure(context);
+        var classroom = await db.Classrooms.AsNoTracking()
+            .Where(item => item.Id == classroomId)
+            .Select(item => new { item.Id, item.Name, item.TeacherId })
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (classroom is null) return ClassroomNotFound(context);
+        if (classroom.TeacherId != teacherId) return Forbidden(context);
+        return Results.Ok(new ClassroomDetailResponse(classroom.Id, classroom.Name));
+    }
+
+    private static async Task<IResult> ListStudentsAsync(Guid classroomId, HttpContext context, EducationPlatformDbContext db)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var teacherId)) return AuthenticationFailure(context);
+        var failure = await ValidateOwnershipAsync(classroomId, teacherId, context, db);
+        if (failure is not null) return failure;
+        var rows = await db.ClassroomMemberships.AsNoTracking()
+            .Where(item => item.ClassroomId == classroomId && item.LeftAt == null)
+            .Join(db.Users, membership => membership.StudentId, user => user.Id,
+                (membership, user) => new
+                {
+                    user.Id,
+                    user.UserName,
+                    user.Name,
+                    user.StudentCode,
+                    membership.JoinedAt
+                })
+            .OrderBy(item => item.Name)
+            .ToListAsync(context.RequestAborted);
+        var students = rows.Select(item => new ClassroomStudentResponse(
+            item.Id, item.UserName!, item.Name, item.StudentCode, item.JoinedAt)).ToList();
+        return Results.Ok(students);
     }
 
     private static async Task<IResult> CreateAsync(
@@ -40,6 +92,12 @@ public static class ClassroomEndpoints
                 "classroom_name_required",
                 "Classroom name is required.",
                 ErrorType.Validation)).ToHttpResult(httpContext);
+        }
+        if (request.Name.Trim().Length > 200)
+        {
+            return Result<CreateClassroomResponse>.Failure(new Error(
+                "invalid_classroom", "Classroom name cannot exceed 200 characters.", ErrorType.Validation))
+                .ToHttpResult(httpContext);
         }
 
         var classroom = new Classroom(Guid.NewGuid(), request.Name, teacherId);
@@ -216,10 +274,22 @@ public static class ClassroomEndpoints
             "duplicate_membership",
             "The student is already an active member of this classroom.",
             ErrorType.Conflict)).ToHttpResult(httpContext);
+
+    private static IResult ClassroomNotFound(HttpContext context) =>
+        Result.Failure(new Error("classroom_not_found", "Classroom was not found.", ErrorType.NotFound)).ToHttpResult(context);
+
+    private static IResult Forbidden(HttpContext context) =>
+        Result.Failure(new Error("forbidden", "You cannot access another teacher's classroom.", ErrorType.Authorization)).ToHttpResult(context);
 }
 
 public sealed record CreateClassroomRequest(string Name);
 
 public sealed record CreateClassroomResponse(Guid Id, string Name);
+
+public sealed record ClassroomSummaryResponse(Guid Id, string Name, int ActiveStudentCount);
+
+public sealed record ClassroomDetailResponse(Guid Id, string Name);
+
+public sealed record ClassroomStudentResponse(Guid StudentId, string UserName, string Name, string? StudentCode, DateTimeOffset JoinedAt);
 
 public sealed record AddStudentRequest(string UserNameOrStudentCode);
