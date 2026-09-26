@@ -1,3 +1,4 @@
+using EducationPlatform.Api.Authentication;
 using EducationPlatform.Api.Persistence;
 using EducationPlatform.Api.Persistence.Classrooms;
 using EducationPlatform.Domain.Classrooms;
@@ -42,6 +43,8 @@ public sealed class ClassroomPersistenceModelTests
         var designTimeModel = dbContext.GetService<IDesignTimeModel>().Model;
         var role = designTimeModel.FindEntityType(typeof(IdentityRole<Guid>));
         Assert.NotNull(role);
-        Assert.Equal(2, role.GetSeedData().Count());
+        var roleNames = role.GetSeedData().Select(data => data[nameof(IdentityRole<Guid>.Name)]).ToArray();
+        Assert.Equal(3, roleNames.Length);
+        Assert.Contains(RoleNames.Admin, roleNames);
     }
 }

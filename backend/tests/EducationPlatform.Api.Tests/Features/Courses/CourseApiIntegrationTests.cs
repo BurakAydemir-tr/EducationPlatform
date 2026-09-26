@@ -542,7 +542,11 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         var users = services.GetRequiredService<UserManager<ApplicationUser>>();
         foreach (var (name, role) in new[] { ("course-teacher", RoleNames.Teacher), ("other-teacher", RoleNames.Teacher), ("course-student", RoleNames.Student), ("other-student", RoleNames.Student) })
         {
-            var user = new ApplicationUser { Id = Guid.NewGuid(), UserName = name, Name = name };
+            var user = new ApplicationUser
+            {
+                Id = Guid.NewGuid(), UserName = name, Name = name,
+                TeacherAccountStatus = role == RoleNames.Teacher ? TeacherAccountStatus.Active : null
+            };
             Assert.True((await users.CreateAsync(user, Password)).Succeeded);
             Assert.True((await users.AddToRoleAsync(user, role)).Succeeded);
         }

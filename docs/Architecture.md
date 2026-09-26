@@ -91,7 +91,7 @@ Bir kullanım senaryosunun endpoint, request/response modeli, request validation
 - QuizAttempt
 - ContentProgress
 
-MVP’de Domain projesinde ayrı bir User aggregate veya entity bulunmayacaktır. Kullanıcı hesapları API/persistence tarafında `ApplicationUser : IdentityUser<Guid>` ile yönetilecek; domain aggregate’leri kullanıcıları `Guid` kimlikleriyle referanslayacaktır. Kullanıcının varlığı ve Teacher/Student rolü application/use-case seviyesinde doğrulanacak, Domain projesi ASP.NET Core Identity’ye bağımlı olmayacaktır. Gerçek domain davranışları gerektiren bir User modeline ihtiyaç doğarsa bu karar yeniden değerlendirilebilir.
+MVP’de Domain projesinde ayrı bir User aggregate veya entity bulunmayacaktır. Kullanıcı hesapları API/persistence tarafında `ApplicationUser : IdentityUser<Guid>` ile yönetilecek; domain aggregate’leri kullanıcıları `Guid` kimlikleriyle referanslayacaktır. Kullanıcının varlığı ve Admin/Teacher/Student rolü application/use-case seviyesinde doğrulanacak, Domain projesi ASP.NET Core Identity’ye bağımlı olmayacaktır. Gerçek domain davranışları gerektiren bir User modeline ihtiyaç doğarsa bu karar yeniden değerlendirilebilir.
 
 Aggregate sınırları ve iş kuralları `docs/DomainModel.md` kararlarına göre uygulanacaktır. Domain katmanı:
 
@@ -163,16 +163,20 @@ ASP.NET Core Identity şu ihtiyaçlar için kullanılacaktır:
 
 - Kullanıcı adı ve parola
 - Güvenli password hashing
-- Teacher ve Student rolleri
+- Admin, Teacher ve Student rolleri
 - Parola değiştirme
 - Hesap kilitleme
 - Teacher tarafından Student hesabı oluşturma
 
 Kullanıcı persistence modeli `ApplicationUser : IdentityUser<Guid>` olacaktır. MVP’de bunun karşılığında Domain projesinde ayrı bir User modeli veya aggregate’i oluşturulmayacaktır.
 
-İlk Teacher hesabı, isteğe bağlı `SeedData:Teacher` configuration değerleriyle ASP.NET Core Identity üzerinden idempotent olarak oluşturulabilir. Kullanıcı adı, ad ve parola birlikte verilmelidir. Parola yalnızca User Secrets, environment variable veya deployment secret üzerinden sağlanmalı; source code, migration veya `appsettings*.json` içine yazılmamalıdır. Configuration bulunmadığında varsayılan kullanıcı veya parola oluşturulmaz.
+İlk Admin hesabı, isteğe bağlı `SeedData:Admin` altındaki `Email`, `Name`, `Surname` ve `Password` configuration değerleriyle ASP.NET Core Identity üzerinden idempotent olarak oluşturulabilir. Değerlerin tamamı birlikte verilmelidir. Parola yalnızca User Secrets, environment variable veya deployment secret üzerinden sağlanmalı; source code, migration veya `appsettings*.json` içine yazılmamalıdır. Configuration bulunmadığında varsayılan kullanıcı veya parola oluşturulmaz. Aynı email ile mevcut kullanıcı Admin değilse otomatik rol yükseltme yapılmaz ve uygulama açık configuration hatasıyla başlatılmaz.
+
+Teacher anonim olarak email, ad, soyad ve parola ile kaydolur; kullanıcı adı email olur ve hesap `Pending` başlar. Teacher rolü hesap tipini, nullable `TeacherAccountStatus` alanı ise yalnızca Teacher hesaplarının `Pending`, `Active`, `Rejected` ve `Disabled` yaşam döngüsünü taşır. Student ve Admin hesaplarında bu alan null’dır. Email onayı bu yönetici onay sürecinden bağımsızdır.
 
 Authentication, cookie yerine JWT kullanacaktır. JWT yapısı kısa ömürlü access token ve daha uzun ömürlü refresh token yaklaşımından oluşacaktır.
+
+Access token süresi configuration üzerinden 10 dakikadır. Teacher login ve refresh sırasında hesabın `Active` olduğu doğrulanır. Her authenticated istekte hesap durumu için database sorgusu yapılmaz; bu nedenle sonradan devre dışı bırakılan Teacher’ın mevcut access tokenı doğal süresi dolana kadar kullanılabilir. Disable işlemi kullanıcının aktif refresh tokenlarının tamamını iptal eder ve refresh sırasında Teacher durumu yeniden kontrol edilir.
 
 Refresh token:
 

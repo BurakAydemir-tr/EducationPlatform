@@ -40,6 +40,14 @@ public sealed class TokenServiceTests
         Assert.Equal(64, token.Hash.Length);
     }
 
+    [Fact]
+    public void AccessTokenExpiration_DefaultsToTenMinutes()
+    {
+        var before = DateTimeOffset.UtcNow.AddMinutes(10);
+        var expiration = CreateService().GetAccessTokenExpiration();
+        Assert.InRange(expiration, before.AddSeconds(-1), before.AddSeconds(1));
+    }
+
     private static TokenService CreateService() => new(
         Options.Create(new JwtOptions
         {

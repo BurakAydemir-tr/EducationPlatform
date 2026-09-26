@@ -3,6 +3,7 @@ using EducationPlatform.Api.Authentication;
 using EducationPlatform.Api.Common.Errors;
 using EducationPlatform.Api.Common.Results;
 using EducationPlatform.Api.Features.Auth;
+using EducationPlatform.Api.Features.Admin;
 using EducationPlatform.Api.Features.Classrooms;
 using EducationPlatform.Api.Features.Courses;
 using EducationPlatform.Api.Features.Learning;
@@ -104,7 +105,7 @@ builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
-await TeacherSeedData.InitializeAsync(app.Services, app.Configuration);
+await AdminSeedData.InitializeAsync(app.Services, app.Configuration);
 
 app.UseExceptionHandler();
 app.UseHttpsRedirection();
@@ -112,6 +113,7 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapAuthEndpoints();
+app.MapAdminEndpoints();
 app.MapClassroomEndpoints();
 app.MapCourseEndpoints();
 app.MapLearningEndpoints();

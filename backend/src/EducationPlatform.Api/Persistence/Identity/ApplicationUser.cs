@@ -7,8 +7,13 @@ public sealed class ApplicationUser : IdentityUser<Guid>
     public const string StudentCodeIndexName = "UX_AspNetUsers_StudentCode";
     public const string UserNameIndexName = "UserNameIndex";
     public const string IdentifierNamespaceConstraintName = "PK_UserIdentifiers";
+    public const string EmailIndexName = "EmailIndex";
 
     public required string Name { get; set; }
 
+    public string? Surname { get; set; }
+
     public string? StudentCode { get; set; }
+
+    public TeacherAccountStatus? TeacherAccountStatus { get; set; }
 }

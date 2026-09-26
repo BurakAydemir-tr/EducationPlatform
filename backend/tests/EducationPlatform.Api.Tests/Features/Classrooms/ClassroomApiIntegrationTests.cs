@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using EducationPlatform.Api.Authentication;
 using EducationPlatform.Api.Features.Auth;
+using EducationPlatform.Api.Features.Admin;
 using EducationPlatform.Api.Features.Classrooms;
 using EducationPlatform.Api.Features.Students;
 using EducationPlatform.Api.Persistence;
@@ -12,6 +13,8 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -195,32 +198,210 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TeacherSeedData_IsIdempotent_AndDoesNotCreateDefaultsWhenMissing()
+    public async Task TeacherRegistration_AdminLifecycle_AndTokenRulesAreEnforced()
     {
-        var missing = new ConfigurationBuilder().AddInMemoryCollection().Build();
-        await TeacherSeedData.InitializeAsync(_factory!.Services, missing);
+        using var publicClient = CreateHttpsClient();
+        var invalidEmail = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration",
+            new TeacherRegistrationRequest("invalid", "Name", "Surname", Password));
+        Assert.Equal(HttpStatusCode.BadRequest, invalidEmail.StatusCode);
+        var weakPassword = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration",
+            new TeacherRegistrationRequest("weak@example.com", "Name", "Surname", "short"));
+        Assert.Equal(HttpStatusCode.BadRequest, weakPassword.StatusCode);
 
-        const string seedUserName = "seed-teacher";
+        foreach (var invalidRequest in new[]
+        {
+            new TeacherRegistrationRequest("empty-name@example.com", " ", "Surname", Password),
+            new TeacherRegistrationRequest("empty-surname@example.com", "Name", " ", Password),
+            new TeacherRegistrationRequest("long-name@example.com", new string('n', 201), "Surname", Password),
+            new TeacherRegistrationRequest("long-surname@example.com", "Name", new string('s', 201), Password),
+            new TeacherRegistrationRequest($"{new string('e', 245)}@example.com", "Name", "Surname", Password)
+        })
+        {
+            var response = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration", invalidRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            await AssertProblemCodeAsync(response, "invalid_teacher_registration");
+        }
+
+        foreach (var collision in new[] { "identifier@example.com", "code@example.com" })
+        {
+            var response = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration",
+                new TeacherRegistrationRequest(collision, "Name", "Surname", Password));
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertProblemCodeAsync(response, "teacher_account_exists");
+        }
+
+        const string email = "pending.teacher@example.com";
+        var registration = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration",
+            new
+            {
+                Email = email,
+                Name = "Pending",
+                Surname = "Teacher",
+                Password,
+                Role = RoleNames.Admin,
+                TeacherAccountStatus = TeacherAccountStatus.Active,
+                EmailConfirmed = true
+            });
+        Assert.Equal(HttpStatusCode.Created, registration.StatusCode);
+        var registered = await registration.Content.ReadFromJsonAsync<TeacherRegistrationResponse>();
+        Assert.Equal(TeacherAccountStatus.Pending, registered!.AccountStatus);
+        var registrationJson = await registration.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("accessToken", registrationJson, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("refreshToken", registrationJson, StringComparison.OrdinalIgnoreCase);
+
+        var duplicateRegistration = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration",
+            new TeacherRegistrationRequest(email.ToUpperInvariant(), "Duplicate", "Teacher", Password));
+        Assert.Equal(HttpStatusCode.Conflict, duplicateRegistration.StatusCode);
+        await AssertProblemCodeAsync(duplicateRegistration, "teacher_account_exists");
+
+        var pendingLogin = await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest(email, Password));
+        Assert.Equal(HttpStatusCode.Forbidden, pendingLogin.StatusCode);
+        await AssertProblemCodeAsync(pendingLogin, "teacher_approval_pending");
+
+        var concurrentEmail = $"concurrent.{Guid.NewGuid():N}@example.com";
+        var concurrent = await Task.WhenAll(
+            publicClient.PostAsJsonAsync("/api/auth/teacher-registration", new TeacherRegistrationRequest(concurrentEmail, "One", "Teacher", Password)),
+            publicClient.PostAsJsonAsync("/api/auth/teacher-registration", new TeacherRegistrationRequest(concurrentEmail, "Two", "Teacher", Password)));
+        Assert.Single(concurrent, response => response.StatusCode == HttpStatusCode.Created);
+        Assert.Single(concurrent, response => response.StatusCode == HttpStatusCode.Conflict);
+
+        using var admin = await CreateAuthenticatedClient("admin@example.com");
+        using var student = await CreateAuthenticatedClient("student-one");
+        using var existingTeacher = await CreateAuthenticatedClient("teacher-one");
+        Assert.Equal(HttpStatusCode.Forbidden, (await student.GetAsync("/api/admin/teachers/pending")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await existingTeacher.GetAsync("/api/admin/teachers/pending")).StatusCode);
+        var pending = await admin.GetFromJsonAsync<List<TeacherAdminResponse>>("/api/admin/teachers/pending");
+        Assert.Contains(pending!, item => item.UserId == registered.UserId);
+        var detail = await admin.GetFromJsonAsync<TeacherAdminResponse>($"/api/admin/teachers/{registered.UserId}");
+        Assert.Equal("Pending", detail!.Name);
+        Assert.False(detail.EmailConfirmed);
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await admin.PostAsync($"/api/admin/teachers/{registered.UserId}/approve", null)).StatusCode);
+        var invalidApprove = await admin.PostAsync($"/api/admin/teachers/{registered.UserId}/approve", null);
+        Assert.Equal(HttpStatusCode.Conflict, invalidApprove.StatusCode);
+        await AssertProblemCodeAsync(invalidApprove, "invalid_account_status_transition");
+
+        var activeLoginResponse = await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest(email, Password));
+        Assert.Equal(HttpStatusCode.OK, activeLoginResponse.StatusCode);
+        var activeLogin = await activeLoginResponse.Content.ReadFromJsonAsync<LoginResponse>();
+        Assert.InRange(activeLogin!.AccessTokenExpiresAt - DateTimeOffset.UtcNow, TimeSpan.FromMinutes(9), TimeSpan.FromMinutes(10.1));
+        var activeRefreshResponse = await publicClient.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(activeLogin.RefreshToken));
+        Assert.Equal(HttpStatusCode.OK, activeRefreshResponse.StatusCode);
+        var activeRefresh = await activeRefreshResponse.Content.ReadFromJsonAsync<LoginResponse>();
+        using var activeTeacher = CreateHttpsClient();
+        activeTeacher.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", activeLogin.AccessToken);
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await admin.PostAsync($"/api/admin/teachers/{registered.UserId}/disable", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await activeTeacher.GetAsync("/api/classrooms")).StatusCode);
+        var disabledLogin = await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest(email, Password));
+        Assert.Equal(HttpStatusCode.Forbidden, disabledLogin.StatusCode);
+        await AssertProblemCodeAsync(disabledLogin, "teacher_account_disabled");
+        var disabledRefresh = await publicClient.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(activeRefresh!.RefreshToken));
+        Assert.Equal(HttpStatusCode.Unauthorized, disabledRefresh.StatusCode);
+        await AssertProblemCodeAsync(disabledRefresh, "invalid_refresh_token");
+        var revokedReplay = await publicClient.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(activeRefresh.RefreshToken));
+        Assert.Equal(HttpStatusCode.Unauthorized, revokedReplay.StatusCode);
+        await AssertProblemCodeAsync(revokedReplay, "invalid_refresh_token");
+
+        const string rejectedEmail = "rejected.teacher@example.com";
+        var rejectedRegistration = await publicClient.PostAsJsonAsync("/api/auth/teacher-registration",
+            new TeacherRegistrationRequest(rejectedEmail, "Rejected", "Teacher", Password));
+        var rejected = await rejectedRegistration.Content.ReadFromJsonAsync<TeacherRegistrationResponse>();
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await admin.PostAsync($"/api/admin/teachers/{rejected!.UserId}/reject", null)).StatusCode);
+        var rejectedLogin = await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest(rejectedEmail, Password));
+        Assert.Equal(HttpStatusCode.Forbidden, rejectedLogin.StatusCode);
+        await AssertProblemCodeAsync(rejectedLogin, "teacher_account_rejected");
+
+        await AssertInactiveTeacherRefreshIsRejectedAsync(email: "pending-refresh@example.com", TeacherAccountStatus.Pending,
+            "teacher_approval_pending");
+        await AssertInactiveTeacherRefreshIsRejectedAsync(email: rejectedEmail, TeacherAccountStatus.Rejected,
+            "teacher_account_rejected");
+
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        var stored = await users.FindByNameAsync(email);
+        Assert.Equal("Pending", stored!.Name);
+        Assert.Equal("Teacher", stored.Surname);
+        Assert.True(await users.IsInRoleAsync(stored, RoleNames.Teacher));
+        Assert.False(stored.EmailConfirmed);
+        Assert.All(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().RefreshTokens
+            .Where(token => token.UserId == stored.Id).ToListAsync(), token => Assert.NotNull(token.RevokedAt));
+    }
+
+    private async Task AssertInactiveTeacherRefreshIsRejectedAsync(
+        string email,
+        TeacherAccountStatus status,
+        string expectedCode)
+    {
+        var tokenValue = $"inactive-teacher-refresh-token-{email}";
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+            var user = await users.FindByNameAsync(email);
+            if (user is null)
+            {
+                user = new ApplicationUser
+                {
+                    Id = Guid.NewGuid(), UserName = email, Email = email,
+                    Name = "Inactive", Surname = "Teacher", TeacherAccountStatus = status
+                };
+                Assert.True((await users.CreateAsync(user, Password)).Succeeded);
+                Assert.True((await users.AddToRoleAsync(user, RoleNames.Teacher)).Succeeded);
+            }
+
+            var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+            db.RefreshTokens.Add(new RefreshToken
+            {
+                Id = Guid.NewGuid(), UserId = user.Id,
+                TokenHash = TokenService.HashRefreshToken(tokenValue),
+                ExpiresAt = DateTimeOffset.UtcNow.AddDays(1)
+            });
+            await db.SaveChangesAsync();
+        }
+
+        using var client = CreateHttpsClient();
+        var response = await client.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(tokenValue));
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        await AssertProblemCodeAsync(response, expectedCode);
+    }
+
+    [Fact]
+    public async Task AdminSeedData_IsIdempotent_AndDoesNotCreateDefaultsWhenMissing()
+    {
+        await using var initialScope = _factory!.Services.CreateAsyncScope();
+        var initialCount = await initialScope.ServiceProvider
+            .GetRequiredService<EducationPlatformDbContext>().Users.CountAsync();
+        var missing = new ConfigurationBuilder().AddInMemoryCollection().Build();
+        await AdminSeedData.InitializeAsync(_factory.Services, missing);
+        Assert.Equal(initialCount, await initialScope.ServiceProvider
+            .GetRequiredService<EducationPlatformDbContext>().Users.CountAsync());
+
+        const string seedUserName = "seed-admin@example.com";
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["SeedData:Teacher:UserName"] = seedUserName,
-            ["SeedData:Teacher:Name"] = "Seed Teacher",
-            ["SeedData:Teacher:Password"] = Password
+            ["SeedData:Admin:Email"] = seedUserName,
+            ["SeedData:Admin:Name"] = "Seed",
+            ["SeedData:Admin:Surname"] = "Admin",
+            ["SeedData:Admin:Password"] = Password
         }).Build();
-        await TeacherSeedData.InitializeAsync(_factory.Services, configuration);
-        await TeacherSeedData.InitializeAsync(_factory.Services, configuration);
+        await AdminSeedData.InitializeAsync(_factory.Services, configuration);
+        await AdminSeedData.InitializeAsync(_factory.Services, configuration);
 
         await using var scope = _factory.Services.CreateAsyncScope();
         var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
         var seeded = await users.FindByNameAsync(seedUserName);
         Assert.NotNull(seeded);
-        Assert.True(await users.IsInRoleAsync(seeded!, RoleNames.Teacher));
+        Assert.True(await users.IsInRoleAsync(seeded!, RoleNames.Admin));
+        Assert.Null(seeded.TeacherAccountStatus);
         Assert.Single(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().Users
             .Where(user => user.NormalizedUserName == seedUserName.ToUpperInvariant()).ToListAsync());
     }
 
     [Fact]
-    public async Task TeacherSeedData_RejectsPartialConfigurationAndExistingStudent()
+    public async Task AdminSeedData_RejectsPartialConfigurationAndExistingStudent()
     {
         await using var scope = _factory!.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
@@ -228,27 +409,118 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
 
         var partial = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["SeedData:Teacher:UserName"] = "partial-teacher"
+            ["SeedData:Admin:Email"] = "partial-admin@example.com"
         }).Build();
         var partialError = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => TeacherSeedData.InitializeAsync(_factory.Services, partial));
-        Assert.Contains("UserName, Name and Password together", partialError.Message);
+            () => AdminSeedData.InitializeAsync(_factory.Services, partial));
+        Assert.Contains("Email, Name, Surname and Password together", partialError.Message);
         Assert.Equal(initialCount, await db.Users.CountAsync());
 
         var existingStudent = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["SeedData:Teacher:UserName"] = "student-one",
-            ["SeedData:Teacher:Name"] = "Student One",
-            ["SeedData:Teacher:Password"] = Password
+            ["SeedData:Admin:Email"] = "student-one",
+            ["SeedData:Admin:Name"] = "Student",
+            ["SeedData:Admin:Surname"] = "One",
+            ["SeedData:Admin:Password"] = Password
         }).Build();
         var roleError = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => TeacherSeedData.InitializeAsync(_factory.Services, existingStudent));
-        Assert.Contains("without the Teacher role", roleError.Message);
+            () => AdminSeedData.InitializeAsync(_factory.Services, existingStudent));
+        Assert.Contains("without the Admin role", roleError.Message);
         var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
         var student = await users.FindByNameAsync("student-one");
         Assert.NotNull(student);
-        Assert.False(await users.IsInRoleAsync(student!, RoleNames.Teacher));
+        Assert.False(await users.IsInRoleAsync(student!, RoleNames.Admin));
         Assert.Equal(initialCount, await db.Users.CountAsync());
+    }
+
+    [Fact]
+    public async Task AdminSeedData_RollsBackUserWhenRoleAssignmentFails()
+    {
+        const string email = "rollback-admin@example.com";
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        await db.Database.ExecuteSqlRawAsync("""
+            ALTER TABLE "AspNetUserRoles"
+            ADD CONSTRAINT "CK_Test_RejectAdminRoleAssignment"
+            CHECK ("RoleId" <> '6482b681-4a15-4e88-a822-fad3e70c4091'::uuid) NOT VALID;
+            """);
+
+        try
+        {
+            var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["SeedData:Admin:Email"] = email,
+                ["SeedData:Admin:Name"] = "Rollback",
+                ["SeedData:Admin:Surname"] = "Admin",
+                ["SeedData:Admin:Password"] = Password
+            }).Build();
+
+            await Assert.ThrowsAnyAsync<Exception>(() => AdminSeedData.InitializeAsync(_factory.Services, configuration));
+            db.ChangeTracker.Clear();
+            Assert.False(await db.Users.AnyAsync(user => user.NormalizedUserName == email.ToUpperInvariant()));
+        }
+        finally
+        {
+            await db.Database.ExecuteSqlRawAsync("""
+                ALTER TABLE "AspNetUserRoles" DROP CONSTRAINT IF EXISTS "CK_Test_RejectAdminRoleAssignment";
+                """);
+        }
+    }
+
+    [Fact]
+    public async Task Migration_BackfillsExistingTeacherAsActive_WithoutInventingSurname()
+    {
+        var databaseName = $"{DatabasePrefix}migration_{Guid.NewGuid():N}";
+        var connectionString = new NpgsqlConnectionStringBuilder(_adminConnectionString)
+        {
+            Database = databaseName,
+            Pooling = false
+        }.ConnectionString;
+        await ExecuteAdminCommandAsync($"CREATE DATABASE \"{databaseName}\"");
+
+        try
+        {
+            var options = new DbContextOptionsBuilder<EducationPlatformDbContext>()
+                .UseNpgsql(connectionString)
+                .Options;
+            await using (var db = new EducationPlatformDbContext(options))
+            {
+                var migrator = db.GetService<IMigrator>();
+                await migrator.MigrateAsync("20260910145739_AddQuizAttemptsAndContentProgress");
+            }
+
+            var teacherId = Guid.NewGuid();
+            await using (var connection = new NpgsqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+                await using var insert = new NpgsqlCommand("""
+                    INSERT INTO "AspNetUsers"
+                        ("Id", "Name", "UserName", "NormalizedUserName", "EmailConfirmed",
+                         "PhoneNumberConfirmed", "TwoFactorEnabled", "LockoutEnabled", "AccessFailedCount")
+                    VALUES (@id, 'Existing Teacher', 'existing-teacher', 'EXISTING-TEACHER', FALSE,
+                            FALSE, FALSE, TRUE, 0);
+                    INSERT INTO "AspNetUserRoles" ("UserId", "RoleId")
+                    SELECT @id, "Id" FROM "AspNetRoles" WHERE "NormalizedName" = 'TEACHER';
+                    """, connection);
+                insert.Parameters.AddWithValue("id", teacherId);
+                await insert.ExecuteNonQueryAsync();
+            }
+
+            await using (var db = new EducationPlatformDbContext(options))
+                await db.Database.MigrateAsync();
+
+            await using (var db = new EducationPlatformDbContext(options))
+            {
+                var teacher = await db.Users.AsNoTracking().SingleAsync(user => user.Id == teacherId);
+                Assert.Equal(TeacherAccountStatus.Active, teacher.TeacherAccountStatus);
+                Assert.Null(teacher.Surname);
+            }
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+            await ExecuteAdminCommandAsync($"DROP DATABASE IF EXISTS \"{databaseName}\" WITH (FORCE)");
+        }
     }
 
     public async Task InitializeAsync()
@@ -376,7 +648,7 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
     {
         var roleManager = services.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
         var userManager = services.GetRequiredService<UserManager<ApplicationUser>>();
-        foreach (var role in new[] { RoleNames.Teacher, RoleNames.Student })
+        foreach (var role in new[] { RoleNames.Admin, RoleNames.Teacher, RoleNames.Student })
         {
             if (!await roleManager.RoleExistsAsync(role))
             {
@@ -387,6 +659,9 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
         await CreateUserAsync(userManager, "teacher-one", "Teacher One", RoleNames.Teacher);
         await CreateUserAsync(userManager, "teacher-two", "Teacher Two", RoleNames.Teacher);
         await CreateUserAsync(userManager, "student-one", "Student One", RoleNames.Student, "STU-001");
+        await CreateUserAsync(userManager, "admin@example.com", "Admin User", RoleNames.Admin);
+        await CreateUserAsync(userManager, "identifier@example.com", "Identifier Student", RoleNames.Student);
+        await CreateUserAsync(userManager, "code-owner", "Code Student", RoleNames.Student, "code@example.com");
     }
 
     private static async Task CreateUserAsync(
@@ -401,7 +676,10 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
             Id = Guid.NewGuid(),
             UserName = userName,
             Name = name,
-            StudentCode = studentCode
+            StudentCode = studentCode,
+            Email = role == RoleNames.Admin ? userName : null,
+            Surname = role == RoleNames.Admin ? "Admin" : null,
+            TeacherAccountStatus = role == RoleNames.Teacher ? TeacherAccountStatus.Active : null
         };
         Assert.True((await userManager.CreateAsync(user, Password)).Succeeded);
         Assert.True((await userManager.AddToRoleAsync(user, role)).Succeeded);

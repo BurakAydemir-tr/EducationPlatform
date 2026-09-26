@@ -8,10 +8,13 @@ Bu sürüm kapsamlı bir öğrenme yönetim sistemi değildir. Başarı ölçüt
 
 ## 2. MVP kullanıcı rolleri
 
-MVP yalnızca iki kullanıcı rolü içerir:
+MVP üç kullanıcı rolü içerir:
 
+- `Admin`: Teacher başvurularını görüntüler, onaylar, reddeder ve aktif Teacher hesaplarını devre dışı bırakır.
 - `Teacher`: Sınıfları, öğrencileri, ders içeriklerini ve öğrenci sonuçlarını yönetir.
 - `Student`: Kendisine erişim verilmiş dersleri takip eder, içerikleri tamamlar ve quiz çözer.
+
+Teacher kendi hesabını email, ad, soyad ve parola ile oluşturur. Yeni Teacher hesabı `Pending` durumunda başlar ve Admin tarafından `Active` yapılmadan giriş yapamaz. Başvuru `Rejected`, aktif hesap ise `Disabled` yapılabilir.
 
 ## 3. Teacher yetenekleri
 
@@ -85,7 +88,11 @@ Student:
 
 ### Kimlik ve yetki
 
-- Sistem Teacher ve Student kullanıcılarının giriş yapmasını sağlamalıdır.
+- Sistem Admin, Active Teacher ve Student kullanıcılarının giriş yapmasını sağlamalıdır.
+- Teacher self-registration token üretmeden Pending hesap oluşturmalıdır.
+- Admin Pending Teacher başvurularını listeleyebilmeli, detayını görebilmeli, onaylayabilmeli veya reddedebilmelidir; Active Teacher hesabını devre dışı bırakabilmelidir.
+- Pending, Rejected ve Disabled Teacher giriş yapamamalı veya refresh token yenileyememelidir.
+- Teacher devre dışı bırakıldığında aktif refresh tokenları iptal edilmelidir. Önceden verilmiş access token doğal, en fazla 10 dakikalık ömrünün sonuna kadar geçerli kalabilir.
 - Kullanıcı yalnızca rolüne ve sahip olduğu erişime uygun işlemleri yapabilmelidir.
 - Teacher yalnızca kendisine ait Classroom ve Course’ları yönetebilmelidir.
 
@@ -139,6 +146,16 @@ Student:
 - Erişim kaybında ContentProgress ve tamamlanmış QuizAttempt geçmişi korunmalıdır. Student’ın Course’a son aktif erişimi de sona erdiğinde o Course kapsamındaki tamamlanmamış QuizAttempt kayıtları silinmelidir.
 
 ## 7. Kabul kriterleri
+
+### Teacher hesabı ve Admin onayı
+
+- Geçerli email, ad, soyad ve parola ile kayıt olan Teacher hesabı `Pending` oluşturulmalı; kayıt cevabı token içermemelidir.
+- Teacher rolü ve başlangıç durumu yalnızca server tarafından belirlenmeli; client Admin rolü, Active durum veya email onayı atayamamalıdır.
+- Pending Teacher Admin tarafından onaylandığında `Active` olmalı; reddedildiğinde `Rejected` olmalıdır.
+- Active Teacher Admin tarafından devre dışı bırakıldığında `Disabled` olmalı ve aktif refresh tokenları iptal edilmelidir.
+- Pending, Rejected ve Disabled Teacher giriş veya refresh yapamamalıdır; yalnızca Active Teacher token alabilmelidir.
+- Admin endpointlerine Teacher ve Student erişememelidir.
+- Admin onay, ret veya disable işlemi `EmailConfirmed` değerini değiştirmemelidir.
 
 ### Teacher ve Classroom
 
@@ -204,7 +221,7 @@ Student:
 - Yapay zekâ ile içerik üretimi
 - Mobil uygulama
 - Veli rolü
-- Admin paneli
+- Eğitim platformunun kapsamlı Admin paneli (MVP yalnızca Teacher hesap onayı yönetimini içerir)
 - Okul veya kurum yönetimi
 - Mesajlaşma
 - Bildirim sistemi
@@ -229,6 +246,7 @@ Student:
 
 MVP aşağıdaki kullanıcı sonuçlarının tamamı sağlandığında tamamlanmış kabul edilir:
 
+- Teacher kendi hesabını oluşturabilir; Admin başvuruyu onaylayabilir, reddedebilir veya onaylanmış hesabı devre dışı bırakabilir.
 - Teacher giriş yapıp bir Classroom oluşturabilir, yeni veya mevcut Student’ı bu Classroom’a ekleyebilir ve gerektiğinde çıkarabilir.
 - Teacher haftalara ayrılmış; Topic, Video ve Quiz içeren bir Course hazırlayabilir, sıralayabilir, bir veya daha fazla Classroom’a atayabilir ve Published yapabilir.
 - Draft Course Student’a görünmez; yetkili Student Published Course’u ve haftalık içeriklerini doğru sırada görebilir.

@@ -20,13 +20,17 @@ Domain modeli kapsamlı bir LMS oluşturmayı hedeflemez. Yalnızca bu temel dav
 
 ### Kullanıcı hesabı ve kimlik referansları
 
-MVP’de `EducationPlatform.Domain` içinde ayrı bir User aggregate veya entity bulunmaz. Kullanıcı hesabı, kimlik bilgileri ve Teacher/Student rolleri API/persistence tarafında ASP.NET Core Identity ile yönetilir.
+MVP’de `EducationPlatform.Domain` içinde ayrı bir User aggregate veya entity bulunmaz. Kullanıcı hesabı, kimlik bilgileri ve Admin/Teacher/Student rolleri API/persistence tarafında ASP.NET Core Identity ile yönetilir.
 
 Classroom, Course, QuizAttempt ve ContentProgress gibi domain modelleri kullanıcıları `Guid` kimlikleri üzerinden referanslar. Kullanıcının varlığı ve gerekli role sahip olması application/use-case seviyesinde doğrulanır. Domain projesi ASP.NET Core Identity’ye bağımlı değildir.
 
 MVP’de öğretmen, öğrencinin adı ve sistem genelinde benzersiz kullanıcı adıyla öğrenci hesabı oluşturabilir. Sistem geçici giriş bilgisi oluşturabilir ve öğrenciden ilk girişte parolasını değiştirmesini isteyebilir. Bu hesap ve kimlik doğrulama davranışları domain modelinin dışındadır.
 
 Kullanıcı adı ve öğrenci kodu aynı normalize edilmiş identifier alanını paylaşır. Bir kullanıcının kullanıcı adı, başka bir kullanıcının öğrenci koduyla çakışamaz; aynı kural ters yönde de geçerlidir.
+
+Teacher hesabı anonim self-registration ile `Email`, `Name`, `Surname` ve parola alınarak oluşturulur; `UserName` email değeridir. Teacher rolü hesap türünü, `TeacherAccountStatus` ise hesabın `Pending`, `Active`, `Rejected` veya `Disabled` yaşam döngüsü durumunu belirtir. Yalnızca `Active` Teacher giriş yapabilir ve token yenileyebilir. `EmailConfirmed`, yönetici onayından bağımsızdır. Bu hesap yaşam döngüsü domain aggregate’i değil, authentication/application concern’üdür.
+
+Teacher geçişleri yalnızca `Pending → Active`, `Pending → Rejected` ve `Active → Disabled` şeklindedir. Admin onay, ret ve devre dışı bırakma işlemlerini yürütür. Teacher devre dışı bırakıldığında aktif refresh tokenları iptal edilir. Daha önce verilmiş access token, her istekte hesap durumu sorgulanmadığı için doğal ve en fazla 10 dakikalık süresi dolana kadar çalışabilir.
 
 ### Classroom
 
@@ -456,7 +460,7 @@ Aşağıdaki özellikler MVP domain modeline dahil değildir:
 - Okul veya kurum hiyerarşisi
 - Çoklu kurum desteği
 - Akademik yıl ve dönem yönetimi
-- Yönetici ve veli rolleri
+- Veli rolü ve eğitim içeriği dışında genel yönetim paneli
 - Yardımcı öğretmen desteği
 - E-posta davet sistemi
 - Toplu öğrenci içe aktarma
