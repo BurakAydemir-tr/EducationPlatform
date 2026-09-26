@@ -63,9 +63,14 @@ public static class QuizEndpoints
             return Failure(context, "authentication_required", "Authentication is required.", ErrorType.Authentication);
         var validation = Validate(request.Title, request.Questions);
         if (validation is not null) return Failure(context, "invalid_quiz", validation, ErrorType.Validation);
-        var quiz = await db.Quizzes.Include(item => item.Questions).ThenInclude(item => item.Options)
-            .SingleOrDefaultAsync(item => item.Id == quizId, context.RequestAborted);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var quiz = await db.Quizzes
+            .FromSqlInterpolated($"""SELECT * FROM "Quizzes" WHERE "Id" = {quizId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
         if (quiz is null) return Failure(context, "quiz_not_found", "Quiz was not found.", ErrorType.NotFound);
+        await db.Entry(quiz).Collection(item => item.Questions).Query()
+            .Include(item => item.Options)
+            .LoadAsync(context.RequestAborted);
         if (quiz.TeacherId != teacherId) return Failure(context, "forbidden", "You cannot manage another teacher's quiz.", ErrorType.Authorization);
         if (quiz.IsLocked) return Failure(context, "quiz_locked", "Quiz cannot be changed after an attempt has started.", ErrorType.Conflict);
         var replacedQuestions = quiz.Questions.ToList();
@@ -80,7 +85,6 @@ public static class QuizEndpoints
             return Failure(context, "invalid_quiz", exception.Message, ErrorType.Validation);
         }
 
-        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
         var replacedQuestionIds = replacedQuestions.Select(item => item.Id).ToList();
         await db.Set<Option>().Where(option => replacedQuestionIds.Contains(EF.Property<Guid>(option, "QuestionId")))
             .ExecuteDeleteAsync(context.RequestAborted);

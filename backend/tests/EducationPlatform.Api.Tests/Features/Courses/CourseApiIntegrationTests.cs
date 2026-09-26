@@ -31,6 +31,7 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
     private const string Password = "Integration123!";
     private WebApplicationFactory<Program>? _factory;
     private string? _adminConnectionString;
+    private string? _testConnectionString;
     private string? _databaseName;
 
     [Fact]
@@ -275,6 +276,110 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ConcurrentStartBeforeUpdate_LocksQuizAndUpdateReturnsConflict()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var setup = await CreateAccessibleLearningQuiz(teacher);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockQuizAsync(blocker, blockerTransaction, setup.QuizId);
+
+        var startTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForQuizLockWaitersAsync(1);
+        var updateTask = teacher.PutAsJsonAsync($"/api/quizzes/{setup.QuizId}", UpdatedQuizRequest());
+        await WaitForQuizLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        var start = await startTask;
+        var update = await updateTask;
+        Assert.Equal(HttpStatusCode.Created, start.StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, update.StatusCode);
+        await AssertProblemCode(update, "quiz_locked");
+
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var quiz = await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().Quizzes
+            .AsNoTracking().Include(item => item.Questions).ThenInclude(item => item.Options)
+            .SingleAsync(item => item.Id == setup.QuizId);
+        Assert.True(quiz.IsLocked);
+        Assert.Equal("Learning quiz", quiz.Title);
+        Assert.Equal("Question", Assert.Single(quiz.Questions).Text);
+    }
+
+    [Fact]
+    public async Task ConcurrentUpdateBeforeStart_StartsAttemptWithUpdatedQuizContent()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var setup = await CreateAccessibleLearningQuiz(teacher);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockQuizAsync(blocker, blockerTransaction, setup.QuizId);
+
+        var updateTask = teacher.PutAsJsonAsync($"/api/quizzes/{setup.QuizId}", UpdatedQuizRequest());
+        await WaitForQuizLockWaitersAsync(1);
+        var startTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForQuizLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        var update = await updateTask;
+        var start = await startTask;
+        Assert.Equal(HttpStatusCode.NoContent, update.StatusCode);
+        Assert.Equal(HttpStatusCode.Created, start.StatusCode);
+        var attempt = await start.Content.ReadFromJsonAsync<StartQuizAttemptResponse>();
+        var responseQuestion = Assert.Single(attempt!.Questions);
+        Assert.Equal("Updated question", responseQuestion.Text);
+
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var quiz = await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().Quizzes
+            .AsNoTracking().Include(item => item.Questions).ThenInclude(item => item.Options)
+            .SingleAsync(item => item.Id == setup.QuizId);
+        var storedQuestion = Assert.Single(quiz.Questions);
+        Assert.True(quiz.IsLocked);
+        Assert.Equal("Updated quiz", quiz.Title);
+        Assert.Equal(storedQuestion.Id, responseQuestion.Id);
+        Assert.Equal(
+            storedQuestion.Options.OrderBy(item => item.Order).Select(item => item.Id),
+            responseQuestion.Options.OrderBy(item => item.Order).Select(item => item.Id));
+    }
+
+    [Fact]
+    public async Task ConcurrentAttemptStarts_BothSucceedAndCreateDistinctAttempts()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var setup = await CreateAccessibleLearningQuiz(teacher);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockQuizAsync(blocker, blockerTransaction, setup.QuizId);
+
+        var firstTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForQuizLockWaitersAsync(1);
+        var secondTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForQuizLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        var first = await firstTask;
+        var second = await secondTask;
+        Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+        Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+        var firstAttempt = await first.Content.ReadFromJsonAsync<StartQuizAttemptResponse>();
+        var secondAttempt = await second.Content.ReadFromJsonAsync<StartQuizAttemptResponse>();
+        Assert.NotEqual(firstAttempt!.AttemptId, secondAttempt!.AttemptId);
+
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.True((await db.Quizzes.AsNoTracking().SingleAsync(item => item.Id == setup.QuizId)).IsLocked);
+        Assert.Equal(2, await db.QuizAttempts.CountAsync(item => item.QuizId == setup.QuizId));
+    }
+
+    [Fact]
     public async Task Student_CanCompleteContentAndQuiz_ReportsAreCalculated_AndLostAccessRemovesOnlyIncompleteAttempt()
     {
         using var teacher = await AuthenticatedClient("course-teacher");
@@ -486,6 +591,58 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         return (course.Id, topic!.Id, quiz.Id, quizContent!.Id);
     }
 
+    private async Task<(Guid CourseId, Guid TopicId, Guid QuizId, Guid QuizContentId)> CreateAccessibleLearningQuiz(HttpClient teacher)
+    {
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, $"Concurrency {Guid.NewGuid():N}");
+        return await CreatePublishedLearningCourse(teacher, [classroomId]);
+    }
+
+    private static UpdateQuizRequest UpdatedQuizRequest() => new(
+        "Updated quiz",
+        [
+            new CreateQuestionRequest("Updated question", 1,
+            [
+                new CreateOptionRequest("Updated correct", 1, true),
+                new CreateOptionRequest("Updated wrong", 2, false)
+            ])
+        ]);
+
+    private static async Task LockQuizAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        Guid quizId)
+    {
+        await using var command = new NpgsqlCommand(
+            """SELECT "Id" FROM "Quizzes" WHERE "Id" = @quizId FOR UPDATE""",
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("quizId", quizId);
+        Assert.Equal(quizId, await command.ExecuteScalarAsync());
+    }
+
+    private async Task WaitForQuizLockWaitersAsync(int expectedCount)
+    {
+        await using var connection = new NpgsqlConnection(_testConnectionString);
+        await connection.OpenAsync();
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            await using var command = new NpgsqlCommand("""
+                SELECT COUNT(*)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND wait_event_type = 'Lock'
+                  AND query LIKE '%FOR UPDATE%'
+                """, connection);
+            if (Convert.ToInt32(await command.ExecuteScalarAsync()) >= expectedCount) return;
+            await Task.Delay(25);
+        }
+
+        throw new TimeoutException($"Expected {expectedCount} Quiz row-lock waiter(s).");
+    }
+
     public async Task InitializeAsync()
     {
         var configured = Environment.GetEnvironmentVariable(ConnectionStringVariable);
@@ -493,6 +650,7 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         _adminConnectionString = new NpgsqlConnectionStringBuilder(configured) { Database = "postgres", Pooling = false, Timeout = 5, CommandTimeout = 30 }.ConnectionString;
         _databaseName = $"{DatabasePrefix}{Guid.NewGuid():N}";
         var testConnection = new NpgsqlConnectionStringBuilder(_adminConnectionString) { Database = _databaseName, Pooling = false }.ConnectionString;
+        _testConnectionString = testConnection;
         await AdminCommand($"CREATE DATABASE \"{_databaseName}\"");
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {

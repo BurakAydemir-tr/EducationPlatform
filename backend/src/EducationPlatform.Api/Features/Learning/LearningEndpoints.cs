@@ -35,14 +35,25 @@ public static class LearningEndpoints
             .AnyAsync(item => item.Type == WeekContentType.Quiz && item.QuizId == quizId, context.RequestAborted);
         if (!accessible) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
 
-        var quiz = await db.Quizzes.Include(item => item.Questions).ThenInclude(question => question.Options)
-            .SingleAsync(item => item.Id == quizId, context.RequestAborted);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var quiz = await db.Quizzes
+            .FromSqlInterpolated($"""SELECT * FROM "Quizzes" WHERE "Id" = {quizId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (quiz is null) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
+        await db.Entry(quiz).Collection(item => item.Questions).Query()
+            .Include(question => question.Options)
+            .LoadAsync(context.RequestAborted);
+
+        accessible = await LearningAccess.AccessibleContents(db, studentId)
+            .AnyAsync(item => item.Type == WeekContentType.Quiz && item.QuizId == quizId, context.RequestAborted);
+        if (!accessible) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
         if (!quiz.IsValid) return Failure(context, "invalid_quiz", "Quiz is not valid.", ErrorType.Conflict);
 
         quiz.Lock();
         var attempt = new QuizAttempt(Guid.NewGuid(), studentId, quizId, timeProvider.GetUtcNow());
         db.QuizAttempts.Add(attempt);
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
 
         return Results.Created($"/api/student/quiz-attempts/{attempt.Id}", new StartQuizAttemptResponse(
             attempt.Id,
