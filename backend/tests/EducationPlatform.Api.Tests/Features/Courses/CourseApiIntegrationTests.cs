@@ -380,6 +380,226 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ConcurrentStartBeforeMembershipRemoval_CreatesThenRemovesIncompleteAttempt()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Start wins membership race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+
+        var startTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForRowLockWaitersAsync(1);
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{classroomId}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        var start = await startTask;
+        var removal = await removalTask;
+        Assert.Equal(HttpStatusCode.Created, start.StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, removal.StatusCode);
+
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.False(await db.QuizAttempts.AnyAsync(item => item.QuizId == setup.QuizId && item.StudentId == studentId && item.CompletedAt == null));
+    }
+
+    [Fact]
+    public async Task ConcurrentMembershipRemovalBeforeStart_ReturnsQuizNotAccessible()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Removal wins membership race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{classroomId}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(1);
+        var startTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        var start = await startTask;
+        Assert.Equal(HttpStatusCode.NotFound, start.StatusCode);
+        await AssertProblemCode(start, "quiz_not_accessible");
+    }
+
+    [Fact]
+    public async Task ConcurrentAssignmentRemovalBeforeStart_ReturnsQuizNotAccessible()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Removal wins assignment race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+
+        var removalTask = teacher.DeleteAsync($"/api/courses/{setup.CourseId}/classrooms/{classroomId}");
+        await WaitForRowLockWaitersAsync(1);
+        var startTask = student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null);
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        var start = await startTask;
+        Assert.Equal(HttpStatusCode.NotFound, start.StatusCode);
+        await AssertProblemCode(start, "quiz_not_accessible");
+    }
+
+    [Fact]
+    public async Task ConcurrentRemoval_PreservesAttemptWithAlternativeAccess_AndTwoLastRemovalsDeleteIt()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var firstRoom = await CreateRoomAndAddStudent(teacher, studentId, "Concurrent alternative one");
+        var secondRoom = await CreateRoomAndAddStudent(teacher, studentId, "Concurrent alternative two");
+        var setup = await CreatePublishedLearningCourse(teacher, [firstRoom, secondRoom]);
+        var attempt = await StartAttempt(student, setup.QuizId);
+
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.DeleteAsync($"/api/classrooms/{firstRoom}/students/{studentId}")).StatusCode);
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+            Assert.True(await db.QuizAttempts.AnyAsync(item => item.Id == attempt.AttemptId));
+        }
+        Assert.Equal(HttpStatusCode.Created, (await student.PostAsync($"/api/student/quizzes/{setup.QuizId}/attempts", null)).StatusCode);
+
+        var thirdRoom = await CreateRoomAndAddStudent(teacher, studentId, "Concurrent last path one");
+        var fourthRoom = await CreateRoomAndAddStudent(teacher, studentId, "Concurrent last path two");
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.PostAsync($"/api/courses/{setup.CourseId}/classrooms/{thirdRoom}", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.PostAsync($"/api/courses/{setup.CourseId}/classrooms/{fourthRoom}", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await teacher.DeleteAsync($"/api/classrooms/{secondRoom}/students/{studentId}")).StatusCode);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var firstRemoval = teacher.DeleteAsync($"/api/classrooms/{thirdRoom}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(1);
+        var secondRemoval = teacher.DeleteAsync($"/api/classrooms/{fourthRoom}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.All(await Task.WhenAll(firstRemoval, secondRemoval), response => Assert.Equal(HttpStatusCode.NoContent, response.StatusCode));
+        await using var finalScope = _factory!.Services.CreateAsyncScope();
+        var finalDb = finalScope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.False(await finalDb.QuizAttempts.AnyAsync(item => item.StudentId == studentId && item.QuizId == setup.QuizId && item.CompletedAt == null));
+    }
+
+    [Fact]
+    public async Task ConcurrentCompletions_PersistOnlyFirstWinnersAnswersScoreAndProgress()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var setup = await CreateAccessibleLearningQuiz(teacher);
+        var attempt = await StartAttempt(student, setup.QuizId);
+        var question = Assert.Single(attempt.Questions);
+        var correct = question.Options.Single(item => item.Order == 1);
+        var wrong = question.Options.Single(item => item.Order == 2);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var winningTask = student.PostAsJsonAsync($"/api/student/quiz-attempts/{attempt.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(question.Id, correct.Id)]));
+        await WaitForRowLockWaitersAsync(1);
+        var losingTask = student.PostAsJsonAsync($"/api/student/quiz-attempts/{attempt.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(question.Id, wrong.Id)]));
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        var winning = await winningTask;
+        var losing = await losingTask;
+        Assert.Equal(HttpStatusCode.OK, winning.StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, losing.StatusCode);
+        await AssertProblemCode(losing, "quiz_attempt_already_completed");
+
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        var persisted = await db.QuizAttempts.AsNoTracking().Include(item => item.Answers).SingleAsync(item => item.Id == attempt.AttemptId);
+        Assert.Equal(100m, persisted.Score);
+        Assert.Equal(correct.Id, Assert.Single(persisted.Answers).SelectedOptionId);
+        Assert.Equal(1, await db.ContentProgress.CountAsync(item => item.ContentId == setup.QuizContentId));
+    }
+
+    [Fact]
+    public async Task ConcurrentRemovalBeforeCompletion_ReturnsQuizNotAccessibleAndDeletesAttempt()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Removal before completion");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+        var attempt = await StartAttempt(student, setup.QuizId);
+        var question = Assert.Single(attempt.Questions);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{classroomId}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(1);
+        var completionTask = student.PostAsJsonAsync($"/api/student/quiz-attempts/{attempt.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(question.Id, question.Options[0].Id)]));
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        var completion = await completionTask;
+        Assert.Equal(HttpStatusCode.NotFound, completion.StatusCode);
+        await AssertProblemCode(completion, "quiz_not_accessible");
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        Assert.False(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().QuizAttempts.AnyAsync(item => item.Id == attempt.AttemptId));
+    }
+
+    [Fact]
+    public async Task ConcurrentCompletionBeforeRemoval_PreservesCompletedAttemptAndProgress()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Completion before removal");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+        var attempt = await StartAttempt(student, setup.QuizId);
+        var question = Assert.Single(attempt.Questions);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var completionTask = student.PostAsJsonAsync($"/api/student/quiz-attempts/{attempt.AttemptId}/complete",
+            new CompleteQuizAttemptRequest([new QuizAnswerRequest(question.Id, question.Options[0].Id)]));
+        await WaitForRowLockWaitersAsync(1);
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{classroomId}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.OK, (await completionTask).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.True(await db.QuizAttempts.AnyAsync(item => item.Id == attempt.AttemptId && item.CompletedAt != null));
+        Assert.True(await db.ContentProgress.AnyAsync(item => item.StudentId == studentId && item.ContentId == setup.QuizContentId));
+    }
+
+    [Fact]
     public async Task Student_CanCompleteContentAndQuiz_ReportsAreCalculated_AndLostAccessRemovesOnlyIncompleteAttempt()
     {
         using var teacher = await AuthenticatedClient("course-teacher");
@@ -598,6 +818,13 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         return await CreatePublishedLearningCourse(teacher, [classroomId]);
     }
 
+    private static async Task<StartQuizAttemptResponse> StartAttempt(HttpClient student, Guid quizId)
+    {
+        var response = await student.PostAsync($"/api/student/quizzes/{quizId}/attempts", null);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        return (await response.Content.ReadFromJsonAsync<StartQuizAttemptResponse>())!;
+    }
+
     private static UpdateQuizRequest UpdatedQuizRequest() => new(
         "Updated quiz",
         [
@@ -621,7 +848,23 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
         Assert.Equal(quizId, await command.ExecuteScalarAsync());
     }
 
+    private static async Task LockCourseAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        Guid courseId)
+    {
+        await using var command = new NpgsqlCommand(
+            """SELECT "Id" FROM "Courses" WHERE "Id" = @courseId FOR UPDATE""",
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("courseId", courseId);
+        Assert.Equal(courseId, await command.ExecuteScalarAsync());
+    }
+
     private async Task WaitForQuizLockWaitersAsync(int expectedCount)
+        => await WaitForRowLockWaitersAsync(expectedCount);
+
+    private async Task WaitForRowLockWaitersAsync(int expectedCount)
     {
         await using var connection = new NpgsqlConnection(_testConnectionString);
         await connection.OpenAsync();
@@ -640,7 +883,7 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
             await Task.Delay(25);
         }
 
-        throw new TimeoutException($"Expected {expectedCount} Quiz row-lock waiter(s).");
+        throw new TimeoutException($"Expected {expectedCount} row-lock waiter(s).");
     }
 
     public async Task InitializeAsync()

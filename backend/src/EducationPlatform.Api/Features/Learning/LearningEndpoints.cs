@@ -31,11 +31,20 @@ public static class LearningEndpoints
     private static async Task<IResult> StartAttemptAsync(Guid quizId, HttpContext context, EducationPlatformDbContext db, TimeProvider timeProvider)
     {
         if (!CurrentUser.TryGetId(context.User, out var studentId)) return Authentication(context);
-        var accessible = await LearningAccess.AccessibleContents(db, studentId)
-            .AnyAsync(item => item.Type == WeekContentType.Quiz && item.QuizId == quizId, context.RequestAborted);
-        if (!accessible) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
+        var courseId = await (from content in LearningAccess.AccessibleContents(db, studentId)
+            join week in db.CourseWeeks on EF.Property<Guid>(content, "CourseWeekId") equals week.Id
+            where content.Type == WeekContentType.Quiz && content.QuizId == quizId
+            select (Guid?)EF.Property<Guid>(week, "CourseId"))
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseId is null) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
 
         await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var courseLocked = await db.Courses
+            .FromSqlInterpolated($"""SELECT * FROM "Courses" WHERE "Id" = {courseId.Value} FOR UPDATE""")
+            .AsNoTracking()
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseLocked is null) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
+
         var quiz = await db.Quizzes
             .FromSqlInterpolated($"""SELECT * FROM "Quizzes" WHERE "Id" = {quizId} FOR UPDATE""")
             .SingleOrDefaultAsync(context.RequestAborted);
@@ -44,7 +53,7 @@ public static class LearningEndpoints
             .Include(question => question.Options)
             .LoadAsync(context.RequestAborted);
 
-        accessible = await LearningAccess.AccessibleContents(db, studentId)
+        var accessible = await LearningAccess.AccessibleContents(db, studentId)
             .AnyAsync(item => item.Type == WeekContentType.Quiz && item.QuizId == quizId, context.RequestAborted);
         if (!accessible) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
         if (!quiz.IsValid) return Failure(context, "invalid_quiz", "Quiz is not valid.", ErrorType.Conflict);
@@ -69,9 +78,38 @@ public static class LearningEndpoints
     private static async Task<IResult> CompleteAttemptAsync(Guid attemptId, CompleteQuizAttemptRequest request, HttpContext context, EducationPlatformDbContext db, TimeProvider timeProvider)
     {
         if (!CurrentUser.TryGetId(context.User, out var studentId)) return Authentication(context);
-        var attempt = await db.QuizAttempts.Include(item => item.Answers)
-            .SingleOrDefaultAsync(item => item.Id == attemptId && item.StudentId == studentId, context.RequestAborted);
-        if (attempt is null) return Failure(context, "quiz_attempt_not_found", "Quiz attempt was not found.", ErrorType.NotFound);
+        var attemptQuizId = await db.QuizAttempts.AsNoTracking()
+            .Where(item => item.Id == attemptId && item.StudentId == studentId)
+            .Select(item => (Guid?)item.QuizId)
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (attemptQuizId is null) return Failure(context, "quiz_attempt_not_found", "Quiz attempt was not found.", ErrorType.NotFound);
+
+        var courseId = await (from content in db.WeekContents
+            join week in db.CourseWeeks on EF.Property<Guid>(content, "CourseWeekId") equals week.Id
+            where content.Type == WeekContentType.Quiz && content.QuizId == attemptQuizId.Value
+            select (Guid?)EF.Property<Guid>(week, "CourseId"))
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseId is null) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var courseLocked = await db.Courses
+            .FromSqlInterpolated($"""SELECT * FROM "Courses" WHERE "Id" = {courseId.Value} FOR UPDATE""")
+            .AsNoTracking()
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseLocked is null) return Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
+
+        var attempt = await db.QuizAttempts
+            .FromSqlInterpolated($"""SELECT * FROM "QuizAttempts" WHERE "Id" = {attemptId} AND "StudentId" = {studentId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (attempt is null)
+        {
+            var stillAccessible = await LearningAccess.AccessibleCourses(db, studentId)
+                .AnyAsync(course => course.Id == courseId.Value, context.RequestAborted);
+            return stillAccessible
+                ? Failure(context, "quiz_attempt_not_found", "Quiz attempt was not found.", ErrorType.NotFound)
+                : Failure(context, "quiz_not_accessible", "Quiz is not accessible.", ErrorType.NotFound);
+        }
+        await db.Entry(attempt).Collection(item => item.Answers).LoadAsync(context.RequestAborted);
         if (attempt.IsCompleted) return Failure(context, "quiz_attempt_already_completed", "Quiz attempt is already completed.", ErrorType.Conflict);
 
         var contentId = await LearningAccess.AccessibleContents(db, studentId)
@@ -112,6 +150,8 @@ public static class LearningEndpoints
             db.Entry(progress).State = EntityState.Detached;
             await db.SaveChangesAsync(context.RequestAborted);
         }
+
+        await transaction.CommitAsync(context.RequestAborted);
 
         return Results.Ok(ToAttemptResult(attempt));
     }

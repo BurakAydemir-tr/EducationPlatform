@@ -341,14 +341,23 @@ public static class CourseEndpoints
     {
         if (!CurrentUser.TryGetId(context.User, out var teacherId)) return Authentication(context);
         if (!await db.Courses.AnyAsync(course => course.Id == courseId && course.TeacherId == teacherId, context.RequestAborted)) return CourseNotFound(context);
-        var assignment = await db.CourseClassroomAssignments.SingleOrDefaultAsync(a => a.CourseId == courseId && a.ClassroomId == classroomId && a.RemovedAt == null, context.RequestAborted);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var courseLocked = await db.Courses
+            .FromSqlInterpolated($"""SELECT * FROM "Courses" WHERE "Id" = {courseId} FOR UPDATE""")
+            .AsNoTracking()
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseLocked is null) return CourseNotFound(context);
+
+        var assignment = await db.CourseClassroomAssignments.SingleOrDefaultAsync(
+            item => item.CourseId == courseId && item.ClassroomId == classroomId && item.RemovedAt == null,
+            context.RequestAborted);
         if (assignment is null) return Failure(context, "course_assignment_not_found", "Active course assignment was not found.", ErrorType.NotFound);
         var affectedStudentIds = await db.ClassroomMemberships
             .Where(membership => membership.ClassroomId == classroomId && membership.LeftAt == null)
             .Select(membership => membership.StudentId)
             .ToListAsync(context.RequestAborted);
 
-        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
         assignment.RemovedAt = timeProvider.GetUtcNow();
         await db.SaveChangesAsync(context.RequestAborted);
         foreach (var studentId in affectedStudentIds)

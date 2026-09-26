@@ -208,6 +208,21 @@ public static class ClassroomEndpoints
             return ownershipFailure;
         }
 
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(httpContext.RequestAborted);
+        var affectedCourseIds = await dbContext.CourseClassroomAssignments
+            .Where(assignment => assignment.ClassroomId == classroomId && assignment.RemovedAt == null)
+            .Select(assignment => assignment.CourseId)
+            .Distinct()
+            .OrderBy(courseId => courseId)
+            .ToListAsync(httpContext.RequestAborted);
+        if (affectedCourseIds.Count > 0)
+        {
+            _ = await dbContext.Courses
+                .FromSqlInterpolated($"""SELECT * FROM "Courses" WHERE "Id" = ANY ({affectedCourseIds.ToArray()}) ORDER BY "Id" FOR UPDATE""")
+                .AsNoTracking()
+                .ToListAsync(httpContext.RequestAborted);
+        }
+
         var membership = await dbContext.ClassroomMemberships.SingleOrDefaultAsync(
             item => item.ClassroomId == classroomId
                 && item.StudentId == studentId
@@ -221,13 +236,6 @@ public static class ClassroomEndpoints
                 ErrorType.NotFound)).ToHttpResult(httpContext);
         }
 
-        var affectedCourseIds = await dbContext.CourseClassroomAssignments
-            .Where(assignment => assignment.ClassroomId == classroomId && assignment.RemovedAt == null)
-            .Select(assignment => assignment.CourseId)
-            .Distinct()
-            .ToListAsync(httpContext.RequestAborted);
-
-        await using var transaction = await dbContext.Database.BeginTransactionAsync(httpContext.RequestAborted);
         membership.LeftAt = timeProvider.GetUtcNow();
         await dbContext.SaveChangesAsync(httpContext.RequestAborted);
         await LearningAccess.DeleteIncompleteAttemptsWithoutCourseAccess(
