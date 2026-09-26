@@ -14,19 +14,25 @@ public static class AdminEndpoints
     {
         var group = endpoints.MapGroup("/api/admin/teachers")
             .RequireAuthorization(policy => policy.RequireRole(RoleNames.Admin));
+        group.MapGet("/", ListAsync);
         group.MapGet("/pending", ListPendingAsync);
         group.MapGet("/{teacherId:guid}", GetAsync);
         group.MapPost("/{teacherId:guid}/approve", ApproveAsync);
         group.MapPost("/{teacherId:guid}/reject", RejectAsync);
         group.MapPost("/{teacherId:guid}/disable", DisableAsync);
+        group.MapPost("/{teacherId:guid}/reset-password", ResetPasswordAsync);
         return endpoints;
     }
 
+    private static async Task<IResult> ListAsync(HttpContext context, EducationPlatformDbContext db) =>
+        Results.Ok(await TeacherQuery(db)
+            .OrderBy(user => user.Email)
+            .Select(user => ToResponse(user))
+            .ToListAsync(context.RequestAborted));
+
     private static async Task<IResult> ListPendingAsync(HttpContext context, EducationPlatformDbContext db) =>
-        Results.Ok(await db.Users.AsNoTracking()
+        Results.Ok(await TeacherQuery(db)
             .Where(user => user.TeacherAccountStatus == TeacherAccountStatus.Pending)
-            .Where(user => db.UserRoles.Any(userRole =>
-                userRole.UserId == user.Id && userRole.RoleId == IdentityRoleConfiguration.TeacherRoleId))
             .OrderBy(user => user.Email)
             .Select(user => new TeacherAdminResponse(
                 user.Id,
@@ -36,6 +42,10 @@ public static class AdminEndpoints
                 user.TeacherAccountStatus!.Value,
                 user.EmailConfirmed))
             .ToListAsync(context.RequestAborted));
+
+    private static IQueryable<ApplicationUser> TeacherQuery(EducationPlatformDbContext db) =>
+        db.Users.AsNoTracking().Where(user => db.UserRoles.Any(userRole =>
+            userRole.UserId == user.Id && userRole.RoleId == IdentityRoleConfiguration.TeacherRoleId));
 
     private static async Task<IResult> GetAsync(Guid teacherId, HttpContext context, EducationPlatformDbContext db, UserManager<ApplicationUser> users)
     {
@@ -52,6 +62,36 @@ public static class AdminEndpoints
 
     private static Task<IResult> DisableAsync(Guid teacherId, HttpContext context, EducationPlatformDbContext db, UserManager<ApplicationUser> users, TimeProvider timeProvider) =>
         TransitionAsync(teacherId, TeacherAccountStatus.Active, TeacherAccountStatus.Disabled, true, context, db, users, timeProvider);
+
+    private static async Task<IResult> ResetPasswordAsync(
+        Guid teacherId,
+        ResetTeacherPasswordRequest request,
+        HttpContext context,
+        EducationPlatformDbContext db,
+        UserManager<ApplicationUser> users,
+        TimeProvider timeProvider)
+    {
+        if (string.IsNullOrWhiteSpace(request.NewPassword))
+            return InvalidNewPassword(context, "A new password is required.");
+
+        var teacher = await db.Users.SingleOrDefaultAsync(user => user.Id == teacherId, context.RequestAborted);
+        if (teacher is null || !await users.IsInRoleAsync(teacher, RoleNames.Teacher)) return NotFound(context);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var resetToken = await users.GeneratePasswordResetTokenAsync(teacher);
+        var reset = await users.ResetPasswordAsync(teacher, resetToken, request.NewPassword);
+        if (!reset.Succeeded)
+        {
+            await transaction.RollbackAsync(context.RequestAborted);
+            return InvalidNewPassword(context, string.Join(" ", reset.Errors.Select(error => error.Description)));
+        }
+
+        var now = timeProvider.GetUtcNow();
+        await db.RefreshTokens.Where(token => token.UserId == teacherId && token.RevokedAt == null)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(token => token.RevokedAt, now), context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
+        return Results.NoContent();
+    }
 
     private static async Task<IResult> TransitionAsync(
         Guid teacherId, TeacherAccountStatus expected, TeacherAccountStatus next, bool revokeTokens,
@@ -87,7 +127,12 @@ public static class AdminEndpoints
 
     private static IResult NotFound(HttpContext context) =>
         Result.Failure(new Error("teacher_not_found", "Teacher account was not found.", ErrorType.NotFound)).ToHttpResult(context);
+
+    private static IResult InvalidNewPassword(HttpContext context, string detail) =>
+        Result.Failure(new Error("invalid_new_password", detail, ErrorType.Validation)).ToHttpResult(context);
 }
+
+public sealed record ResetTeacherPasswordRequest(string NewPassword);
 
 public sealed record TeacherAdminResponse(
     Guid UserId, string Email, string Name, string? Surname,

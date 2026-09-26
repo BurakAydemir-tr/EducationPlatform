@@ -1,6 +1,9 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
 using EducationPlatform.Api.Authentication;
 using EducationPlatform.Api.Features.Auth;
 using EducationPlatform.Api.Features.Admin;
@@ -10,6 +13,7 @@ using EducationPlatform.Api.Persistence;
 using EducationPlatform.Api.Persistence.Identity;
 using EducationPlatform.Api.Persistence.SeedData;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
@@ -19,6 +23,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.IdentityModel.Tokens;
 using Npgsql;
 
 namespace EducationPlatform.Api.Tests.Features.Classrooms;
@@ -195,6 +200,235 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
             Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
             await AssertProblemCodeAsync(response, "invalid_refresh_token");
         }
+    }
+
+    [Fact]
+    public async Task Logout_RevokesOnlyOwnedSession_AndIsIdempotent()
+    {
+        using var publicClient = CreateHttpsClient();
+        var first = await LoginAsync(publicClient, "student-one", Password);
+        var second = await LoginAsync(publicClient, "student-one", Password);
+        var otherUser = await LoginAsync(publicClient, "teacher-one", Password);
+        using var student = CreateTokenClient(first.AccessToken);
+
+        var logout = await student.PostAsJsonAsync("/api/auth/logout", new LogoutRequest(first.RefreshToken));
+        Assert.Equal(HttpStatusCode.NoContent, logout.StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await student.PostAsJsonAsync("/api/auth/logout", new LogoutRequest(first.RefreshToken))).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await student.PostAsJsonAsync("/api/auth/logout", new LogoutRequest(otherUser.RefreshToken))).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await student.PostAsJsonAsync("/api/auth/logout", new LogoutRequest("unknown-refresh-token"))).StatusCode);
+
+        await AssertInvalidRefreshAsync(publicClient, first.RefreshToken);
+        Assert.Equal(HttpStatusCode.OK,
+            (await publicClient.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(second.RefreshToken))).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await publicClient.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(otherUser.RefreshToken))).StatusCode);
+    }
+
+    [Fact]
+    public async Task ChangePassword_UsesIdentityRules_AndRevokesAllRefreshTokens()
+    {
+        using var publicClient = CreateHttpsClient();
+        var first = await LoginAsync(publicClient, "student-one", Password);
+        var second = await LoginAsync(publicClient, "student-one", Password);
+        using var student = CreateTokenClient(first.AccessToken);
+
+        var wrongCurrent = await student.PostAsJsonAsync(
+            "/api/auth/change-password", new ChangePasswordRequest("wrong-password", "Different123!"));
+        Assert.Equal(HttpStatusCode.BadRequest, wrongCurrent.StatusCode);
+        await AssertProblemCodeAsync(wrongCurrent, "invalid_current_password");
+
+        var weak = await student.PostAsJsonAsync(
+            "/api/auth/change-password", new ChangePasswordRequest(Password, "short"));
+        Assert.Equal(HttpStatusCode.BadRequest, weak.StatusCode);
+        await AssertProblemCodeAsync(weak, "invalid_new_password");
+
+        const string newPassword = "Different123!";
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await student.PostAsJsonAsync(
+                "/api/auth/change-password", new ChangePasswordRequest(Password, newPassword))).StatusCode);
+        await AssertInvalidRefreshAsync(publicClient, first.RefreshToken);
+        await AssertInvalidRefreshAsync(publicClient, second.RefreshToken);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest("student-one", Password))).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest("student-one", newPassword))).StatusCode);
+
+        var adminLogin = await LoginAsync(publicClient, "admin@example.com", Password);
+        using var admin = CreateTokenClient(adminLogin.AccessToken);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await admin.PostAsJsonAsync(
+                "/api/auth/change-password", new ChangePasswordRequest(Password, "AdminChanged123!"))).StatusCode);
+        await AssertInvalidRefreshAsync(publicClient, adminLogin.RefreshToken);
+
+        var teacherLogin = await LoginAsync(publicClient, "teacher-one", Password);
+        using var activeTeacher = CreateTokenClient(teacherLogin.AccessToken);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await activeTeacher.PostAsJsonAsync(
+                "/api/auth/change-password", new ChangePasswordRequest(Password, "TeacherChanged123!"))).StatusCode);
+        await AssertInvalidRefreshAsync(publicClient, teacherLogin.RefreshToken);
+
+        var pending = await CreateTeacherAsync("password.pending@example.com", TeacherAccountStatus.Pending);
+        using var pendingClient = CreateTokenClient(CreateJwt(pending.Id, RoleNames.Teacher));
+        var inactive = await pendingClient.PostAsJsonAsync(
+            "/api/auth/change-password", new ChangePasswordRequest(Password, newPassword));
+        Assert.Equal(HttpStatusCode.Forbidden, inactive.StatusCode);
+        await AssertProblemCodeAsync(inactive, "teacher_account_not_active");
+    }
+
+    [Fact]
+    public async Task AdminTeacherListAndPasswordReset_EnforceRoleTargetAndTokenRules()
+    {
+        using var publicClient = CreateHttpsClient();
+        using var admin = await CreateAuthenticatedClient("admin@example.com");
+        using var teacher = await CreateAuthenticatedClient("teacher-one");
+        using var student = await CreateAuthenticatedClient("student-one");
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await teacher.GetAsync("/api/admin/teachers")).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await student.GetAsync("/api/admin/teachers")).StatusCode);
+        var teachers = await admin.GetFromJsonAsync<List<TeacherAdminResponse>>("/api/admin/teachers");
+        Assert.Contains(teachers!, item => item.Email == null && item.Name == "Teacher One");
+        var listJson = await (await admin.GetAsync("/api/admin/teachers")).Content.ReadAsStringAsync();
+        Assert.DoesNotContain("passwordHash", listJson, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("securityStamp", listJson, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("accessFailedCount", listJson, StringComparison.OrdinalIgnoreCase);
+
+        var teacherLogin = await LoginAsync(publicClient, "teacher-one", Password);
+        var teacherId = await GetUserIdAsync("teacher-one");
+        var weak = await admin.PostAsJsonAsync(
+            $"/api/admin/teachers/{teacherId}/reset-password", new ResetTeacherPasswordRequest("short"));
+        Assert.Equal(HttpStatusCode.BadRequest, weak.StatusCode);
+        await AssertProblemCodeAsync(weak, "invalid_new_password");
+
+        const string replacement = "AdminReset123!";
+        var reset = await admin.PostAsJsonAsync(
+            $"/api/admin/teachers/{teacherId}/reset-password", new ResetTeacherPasswordRequest(replacement));
+        Assert.Equal(HttpStatusCode.NoContent, reset.StatusCode);
+        Assert.DoesNotContain(replacement, await reset.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        await AssertInvalidRefreshAsync(publicClient, teacherLogin.RefreshToken);
+        using var existingAccessToken = CreateTokenClient(teacherLogin.AccessToken);
+        Assert.Equal(HttpStatusCode.OK, (await existingAccessToken.GetAsync("/api/classrooms")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await publicClient.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-one", replacement))).StatusCode);
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+            var storedTeacher = await users.FindByIdAsync(teacherId.ToString());
+            Assert.Equal(TeacherAccountStatus.Active, storedTeacher!.TeacherAccountStatus);
+            Assert.True(await users.IsInRoleAsync(storedTeacher, RoleNames.Teacher));
+            Assert.False(storedTeacher.EmailConfirmed);
+        }
+
+        var studentId = await GetUserIdAsync("student-one");
+        var adminId = await GetUserIdAsync("admin@example.com");
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await admin.PostAsJsonAsync($"/api/admin/teachers/{studentId}/reset-password", new ResetTeacherPasswordRequest(replacement))).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await admin.PostAsJsonAsync($"/api/admin/teachers/{adminId}/reset-password", new ResetTeacherPasswordRequest(replacement))).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await teacher.PostAsJsonAsync($"/api/admin/teachers/{teacherId}/reset-password", new ResetTeacherPasswordRequest(replacement))).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await student.PostAsJsonAsync($"/api/admin/teachers/{teacherId}/reset-password", new ResetTeacherPasswordRequest(replacement))).StatusCode);
+    }
+
+    [Fact]
+    public async Task LoginLockout_IsExplicitAndResetsFailuresAfterSuccess()
+    {
+        using var client = CreateHttpsClient();
+        for (var attempt = 0; attempt < 2; attempt++)
+            Assert.Equal(HttpStatusCode.Unauthorized,
+                (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-two", "wrong-password"))).StatusCode);
+
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-two", Password))).StatusCode);
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var user = await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>()
+                .FindByNameAsync("teacher-two");
+            Assert.Equal(0, user!.AccessFailedCount);
+        }
+
+        for (var attempt = 0; attempt < 5; attempt++)
+            Assert.Equal(HttpStatusCode.Unauthorized,
+                (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-one", "wrong-password"))).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-one", Password))).StatusCode);
+
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+            var user = await users.FindByNameAsync("teacher-one");
+            Assert.True(await users.IsLockedOutAsync(user!));
+            user!.LockoutEnd = DateTimeOffset.UtcNow.AddSeconds(-1);
+            Assert.True((await users.UpdateAsync(user)).Succeeded);
+        }
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-one", Password))).StatusCode);
+    }
+
+    [Fact]
+    public async Task AuthRateLimiting_ReturnsProblemDetailsWith429()
+    {
+        using var client = CreateHttpsClient();
+        HttpResponseMessage? response = null;
+        for (var attempt = 0; attempt <= 10; attempt++)
+            response = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("missing-user", "wrong-password"));
+
+        Assert.Equal(HttpStatusCode.TooManyRequests, response!.StatusCode);
+        await AssertProblemCodeAsync(response, "rate_limit_exceeded");
+    }
+
+    [Fact]
+    public async Task JwtMiddleware_RejectsInvalidTokens_AndAcceptsAllRoles()
+    {
+        var teacherId = await GetUserIdAsync("teacher-one");
+        var adminId = await GetUserIdAsync("admin@example.com");
+        var studentId = await GetUserIdAsync("student-one");
+        var now = DateTimeOffset.UtcNow;
+        var invalidTokens = new[]
+        {
+            "not-a-jwt",
+            CreateJwt(teacherId, RoleNames.Teacher, expires: now.AddMinutes(-2)),
+            CreateJwt(teacherId, RoleNames.Teacher, issuer: "wrong-issuer"),
+            CreateJwt(teacherId, RoleNames.Teacher, audience: "wrong-audience"),
+            CreateJwt(teacherId, RoleNames.Teacher, signingKey: "different-signing-key-that-is-at-least-32-bytes"),
+            CreateJwt(teacherId, RoleNames.Teacher, notBefore: now.AddMinutes(2))
+        };
+
+        foreach (var token in invalidTokens)
+        {
+            using var client = CreateTokenClient(token);
+            var response = await client.GetAsync("/api/classrooms");
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+            await AssertProblemCodeAsync(response, "authentication_required");
+        }
+
+        using var admin = CreateTokenClient(CreateJwt(adminId, RoleNames.Admin));
+        using var teacher = CreateTokenClient(CreateJwt(teacherId, RoleNames.Teacher));
+        using var student = CreateTokenClient(CreateJwt(studentId, RoleNames.Student));
+        Assert.Equal(HttpStatusCode.OK, (await admin.GetAsync("/api/admin/teachers")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await teacher.GetAsync("/api/classrooms")).StatusCode);
+        Assert.NotEqual(HttpStatusCode.Unauthorized,
+            (await student.GetAsync($"/api/student/courses/{Guid.NewGuid()}/progress")).StatusCode);
+    }
+
+    [Fact]
+    public async Task ConcurrentRefresh_AllowsOnlyOneReplacement()
+    {
+        using var client = CreateHttpsClient();
+        var login = await LoginAsync(client, "admin@example.com", Password);
+        var responses = await Task.WhenAll(
+            client.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(login.RefreshToken)),
+            client.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(login.RefreshToken)));
+        Assert.Single(responses, response => response.StatusCode == HttpStatusCode.OK);
+        Assert.Single(responses, response => response.StatusCode == HttpStatusCode.Unauthorized);
+        var success = Assert.Single(responses, response => response.StatusCode == HttpStatusCode.OK);
+        var replacement = await success.Content.ReadFromJsonAsync<LoginResponse>();
+        Assert.Equal(HttpStatusCode.OK,
+            (await client.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(replacement!.RefreshToken))).StatusCode);
+        await AssertInvalidRefreshAsync(client, login.RefreshToken);
     }
 
     [Fact]
@@ -552,6 +786,8 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.ConfigureLogging(logging => logging.ClearProviders());
+            builder.ConfigureServices(services =>
+                services.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider()));
             builder.ConfigureAppConfiguration((_, configuration) =>
                 configuration.AddInMemoryCollection(new Dictionary<string, string?>
                 {
@@ -597,11 +833,82 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
     private async Task<HttpClient> CreateAuthenticatedClient(string userName)
     {
         var client = CreateHttpsClient();
-        var response = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest(userName, Password));
-        response.EnsureSuccessStatusCode();
-        var login = await response.Content.ReadFromJsonAsync<LoginResponse>();
-        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", login!.AccessToken);
+        var login = await LoginAsync(client, userName, Password);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", login.AccessToken);
         return client;
+    }
+
+    private static async Task<LoginResponse> LoginAsync(HttpClient client, string userName, string password)
+    {
+        var response = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest(userName, password));
+        response.EnsureSuccessStatusCode();
+        return (await response.Content.ReadFromJsonAsync<LoginResponse>())!;
+    }
+
+    private async Task AssertInvalidRefreshAsync(HttpClient client, string token)
+    {
+        var response = await client.PostAsJsonAsync("/api/auth/refresh", new RefreshRequest(token));
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        await AssertProblemCodeAsync(response, "invalid_refresh_token");
+    }
+
+    private HttpClient CreateTokenClient(string accessToken)
+    {
+        var client = CreateHttpsClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        return client;
+    }
+
+    private async Task<Guid> GetUserIdAsync(string userName)
+    {
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        return (await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>()
+            .FindByNameAsync(userName))!.Id;
+    }
+
+    private async Task<ApplicationUser> CreateTeacherAsync(string email, TeacherAccountStatus status)
+    {
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var users = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        var user = new ApplicationUser
+        {
+            Id = Guid.NewGuid(),
+            UserName = email,
+            Email = email,
+            Name = "Status",
+            Surname = "Teacher",
+            TeacherAccountStatus = status
+        };
+        Assert.True((await users.CreateAsync(user, Password)).Succeeded);
+        Assert.True((await users.AddToRoleAsync(user, RoleNames.Teacher)).Succeeded);
+        return user;
+    }
+
+    private static string CreateJwt(
+        Guid userId,
+        string role,
+        DateTimeOffset? expires = null,
+        string issuer = "integration-tests",
+        string audience = "integration-tests",
+        string signingKey = "integration-test-signing-key-at-least-32-bytes",
+        DateTimeOffset? notBefore = null)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var tokenExpires = expires ?? now.AddMinutes(10);
+        var tokenNotBefore = notBefore ?? (tokenExpires <= now ? tokenExpires.AddMinutes(-1) : now.AddMinutes(-1));
+        var token = new JwtSecurityToken(
+            issuer,
+            audience,
+            [
+                new Claim(ClaimTypes.NameIdentifier, userId.ToString()),
+                new Claim(ClaimTypes.Role, role)
+            ],
+            notBefore: tokenNotBefore.UtcDateTime,
+            expires: tokenExpires.UtcDateTime,
+            signingCredentials: new SigningCredentials(
+                new SymmetricSecurityKey(Encoding.UTF8.GetBytes(signingKey)),
+                SecurityAlgorithms.HmacSha256));
+        return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
     private async Task AssertRefreshTokenRotationAsync()

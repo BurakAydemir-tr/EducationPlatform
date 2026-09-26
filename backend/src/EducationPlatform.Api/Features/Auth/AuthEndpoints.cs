@@ -14,10 +14,95 @@ public static class AuthEndpoints
     public static IEndpointRouteBuilder MapAuthEndpoints(this IEndpointRouteBuilder endpoints)
     {
         var group = endpoints.MapGroup("/api/auth");
-        group.MapPost("/login", LoginAsync);
-        group.MapPost("/refresh", RefreshAsync);
-        group.MapPost("/teacher-registration", RegisterTeacherAsync);
+        group.MapPost("/login", LoginAsync).RequireRateLimiting(AuthRateLimitPolicies.Login);
+        group.MapPost("/refresh", RefreshAsync).RequireRateLimiting(AuthRateLimitPolicies.Refresh);
+        group.MapPost("/teacher-registration", RegisterTeacherAsync).RequireRateLimiting(AuthRateLimitPolicies.Registration);
+        group.MapPost("/logout", LogoutAsync).RequireAuthorization();
+        group.MapPost("/change-password", ChangePasswordAsync).RequireAuthorization();
         return endpoints;
+    }
+
+    private static async Task<IResult> LogoutAsync(
+        LogoutRequest request,
+        HttpContext context,
+        EducationPlatformDbContext db,
+        TimeProvider timeProvider)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var userId))
+        {
+            return Result.Failure(new Error(
+                "authentication_required", "Authentication is required.", ErrorType.Authentication)).ToHttpResult(context);
+        }
+
+        if (string.IsNullOrWhiteSpace(request.RefreshToken) || request.RefreshToken.Length > 2048)
+        {
+            return Result.Failure(new Error(
+                "invalid_logout", "A valid refresh token is required.", ErrorType.Validation)).ToHttpResult(context);
+        }
+
+        var hash = TokenService.HashRefreshToken(request.RefreshToken);
+        var now = timeProvider.GetUtcNow();
+        await db.RefreshTokens
+            .Where(token => token.UserId == userId
+                && token.TokenHash == hash
+                && token.RevokedAt == null
+                && token.ExpiresAt > now)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(token => token.RevokedAt, now),
+                context.RequestAborted);
+
+        return Results.NoContent();
+    }
+
+    private static async Task<IResult> ChangePasswordAsync(
+        ChangePasswordRequest request,
+        HttpContext context,
+        UserManager<ApplicationUser> userManager,
+        EducationPlatformDbContext db,
+        TimeProvider timeProvider)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var userId))
+        {
+            return Result.Failure(new Error(
+                "authentication_required", "Authentication is required.", ErrorType.Authentication)).ToHttpResult(context);
+        }
+
+        if (string.IsNullOrWhiteSpace(request.CurrentPassword))
+            return PasswordValidation(context, "invalid_current_password", "The current password is invalid.");
+        if (string.IsNullOrWhiteSpace(request.NewPassword))
+            return PasswordValidation(context, "invalid_new_password", "The new password is invalid.");
+
+        var user = await userManager.FindByIdAsync(userId.ToString());
+        if (user is null)
+        {
+            return Result.Failure(new Error(
+                "authentication_required", "Authentication is required.", ErrorType.Authentication)).ToHttpResult(context);
+        }
+
+        var roles = await userManager.GetRolesAsync(user);
+        if (roles.Contains(RoleNames.Teacher) && user.TeacherAccountStatus != TeacherAccountStatus.Active)
+        {
+            return Result.Failure(new Error(
+                "teacher_account_not_active",
+                "Teacher account must be active to change its password.",
+                ErrorType.Authorization)).ToHttpResult(context);
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var changed = await userManager.ChangePasswordAsync(user, request.CurrentPassword, request.NewPassword);
+        if (!changed.Succeeded)
+        {
+            await transaction.RollbackAsync(context.RequestAborted);
+            return changed.Errors.Any(error => error.Code == nameof(IdentityErrorDescriber.PasswordMismatch))
+                ? PasswordValidation(context, "invalid_current_password", "The current password is invalid.")
+                : PasswordValidation(context, "invalid_new_password", string.Join(" ", changed.Errors.Select(error => error.Description)));
+        }
+
+        var now = timeProvider.GetUtcNow();
+        await db.RefreshTokens.Where(token => token.UserId == userId && token.RevokedAt == null)
+            .ExecuteUpdateAsync(setters => setters.SetProperty(token => token.RevokedAt, now), context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
+        return Results.NoContent();
     }
 
     private static async Task<IResult> RegisterTeacherAsync(
@@ -251,11 +336,18 @@ public static class AuthEndpoints
 
     private static IResult RegistrationConflict(HttpContext context) =>
         Result.Failure(new Error("teacher_account_exists", "An account with the same email or identifier already exists.", ErrorType.Conflict)).ToHttpResult(context);
+
+    private static IResult PasswordValidation(HttpContext context, string code, string detail) =>
+        Result.Failure(new Error(code, detail, ErrorType.Validation)).ToHttpResult(context);
 }
 
 public sealed record LoginRequest(string UserName, string Password);
 
 public sealed record RefreshRequest(string RefreshToken);
+
+public sealed record LogoutRequest(string RefreshToken);
+
+public sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);
 
 public sealed record LoginResponse(string AccessToken, string RefreshToken, DateTimeOffset AccessTokenExpiresAt);
 
