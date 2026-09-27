@@ -170,6 +170,21 @@ public static class LearningEndpoints
     private static async Task<IResult> CompleteContentAsync(Guid contentId, HttpContext context, EducationPlatformDbContext db, TimeProvider timeProvider)
     {
         if (!CurrentUser.TryGetId(context.User, out var studentId)) return Authentication(context);
+
+        var courseId = await (from candidate in db.WeekContents
+            join week in db.CourseWeeks on EF.Property<Guid>(candidate, "CourseWeekId") equals week.Id
+            where candidate.Id == contentId
+            select (Guid?)EF.Property<Guid>(week, "CourseId"))
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseId is null) return Failure(context, "content_not_accessible", "Content is not accessible.", ErrorType.NotFound);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var courseLocked = await db.Courses
+            .FromSqlInterpolated($"""SELECT * FROM "Courses" WHERE "Id" = {courseId.Value} FOR UPDATE""")
+            .AsNoTracking()
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (courseLocked is null) return Failure(context, "content_not_accessible", "Content is not accessible.", ErrorType.NotFound);
+
         var content = await LearningAccess.AccessibleContents(db, studentId)
             .SingleOrDefaultAsync(item => item.Id == contentId, context.RequestAborted);
         if (content is null) return Failure(context, "content_not_accessible", "Content is not accessible.", ErrorType.NotFound);
@@ -188,7 +203,10 @@ public static class LearningEndpoints
         catch (DbUpdateException exception) when (IsProgressDuplicate(exception))
         {
             db.Entry(progress).State = EntityState.Detached;
+            return Results.NoContent();
         }
+
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 

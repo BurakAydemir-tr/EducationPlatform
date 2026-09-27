@@ -600,6 +600,166 @@ public sealed class CourseApiIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ConcurrentContentCompletionBeforeMembershipRemoval_PreservesProgress()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Content completion wins membership race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var completionTask = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(1);
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{classroomId}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await completionTask).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        Assert.True(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().ContentProgress
+            .AnyAsync(item => item.StudentId == studentId && item.ContentId == setup.TopicId));
+    }
+
+    [Fact]
+    public async Task ConcurrentMembershipRemovalBeforeContentCompletion_ReturnsContentNotAccessible()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Membership removal wins content race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{classroomId}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(1);
+        var completionTask = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        var completion = await completionTask;
+        Assert.Equal(HttpStatusCode.NotFound, completion.StatusCode);
+        await AssertProblemCode(completion, "content_not_accessible");
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        Assert.False(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().ContentProgress
+            .AnyAsync(item => item.StudentId == studentId && item.ContentId == setup.TopicId));
+    }
+
+    [Fact]
+    public async Task ConcurrentContentCompletionBeforeAssignmentRemoval_PreservesProgress()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Content completion wins assignment race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var completionTask = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(1);
+        var removalTask = teacher.DeleteAsync($"/api/courses/{setup.CourseId}/classrooms/{classroomId}");
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await completionTask).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        Assert.True(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().ContentProgress
+            .AnyAsync(item => item.StudentId == studentId && item.ContentId == setup.TopicId));
+    }
+
+    [Fact]
+    public async Task ConcurrentAssignmentRemovalBeforeContentCompletion_ReturnsContentNotAccessible()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Assignment removal wins content race");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var removalTask = teacher.DeleteAsync($"/api/courses/{setup.CourseId}/classrooms/{classroomId}");
+        await WaitForRowLockWaitersAsync(1);
+        var completionTask = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        var completion = await completionTask;
+        Assert.Equal(HttpStatusCode.NotFound, completion.StatusCode);
+        await AssertProblemCode(completion, "content_not_accessible");
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        Assert.False(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().ContentProgress
+            .AnyAsync(item => item.StudentId == studentId && item.ContentId == setup.TopicId));
+    }
+
+    [Fact]
+    public async Task ContentCompletionAfterConcurrentRemoval_SucceedsWhenAlternativeAccessRemains()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var firstRoom = await CreateRoomAndAddStudent(teacher, studentId, "Content alternative access one");
+        var secondRoom = await CreateRoomAndAddStudent(teacher, studentId, "Content alternative access two");
+        var setup = await CreatePublishedLearningCourse(teacher, [firstRoom, secondRoom]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var removalTask = teacher.DeleteAsync($"/api/classrooms/{firstRoom}/students/{studentId}");
+        await WaitForRowLockWaitersAsync(1);
+        var completionTask = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.Equal(HttpStatusCode.NoContent, (await removalTask).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await completionTask).StatusCode);
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        Assert.True(await scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>().ContentProgress
+            .AnyAsync(item => item.StudentId == studentId && item.ContentId == setup.TopicId));
+    }
+
+    [Fact]
+    public async Task ConcurrentDuplicateContentCompletions_AreIdempotentAndCreateOneProgress()
+    {
+        using var teacher = await AuthenticatedClient("course-teacher");
+        using var student = await AuthenticatedClient("course-student");
+        var studentId = await StudentId();
+        var classroomId = await CreateRoomAndAddStudent(teacher, studentId, "Duplicate content completion");
+        var setup = await CreatePublishedLearningCourse(teacher, [classroomId]);
+
+        await using var blocker = new NpgsqlConnection(_testConnectionString);
+        await blocker.OpenAsync();
+        await using var blockerTransaction = await blocker.BeginTransactionAsync();
+        await LockCourseAsync(blocker, blockerTransaction, setup.CourseId);
+        var firstCompletion = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(1);
+        var secondCompletion = student.PostAsync($"/api/student/contents/{setup.TopicId}/complete", null);
+        await WaitForRowLockWaitersAsync(2);
+        await blockerTransaction.CommitAsync();
+
+        Assert.All(await Task.WhenAll(firstCompletion, secondCompletion), response => Assert.Equal(HttpStatusCode.NoContent, response.StatusCode));
+        await using var scope = _factory!.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<EducationPlatformDbContext>();
+        Assert.Equal(1, await db.ContentProgress.CountAsync(item => item.StudentId == studentId && item.ContentId == setup.TopicId));
+    }
+
+    [Fact]
     public async Task Student_CanCompleteContentAndQuiz_ReportsAreCalculated_AndLostAccessRemovesOnlyIncompleteAttempt()
     {
         using var teacher = await AuthenticatedClient("course-teacher");
