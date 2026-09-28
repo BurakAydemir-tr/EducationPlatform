@@ -41,6 +41,9 @@ public static class AuthEndpoints
         }
 
         var hash = TokenService.HashRefreshToken(request.RefreshToken);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        await db.Users.FromSqlInterpolated($"""SELECT * FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
         var now = timeProvider.GetUtcNow();
         await db.RefreshTokens
             .Where(token => token.UserId == userId
@@ -51,6 +54,7 @@ public static class AuthEndpoints
                 setters => setters.SetProperty(token => token.RevokedAt, now),
                 context.RequestAborted);
 
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 
@@ -72,7 +76,10 @@ public static class AuthEndpoints
         if (string.IsNullOrWhiteSpace(request.NewPassword))
             return PasswordValidation(context, "invalid_new_password", "The new password is invalid.");
 
-        var user = await userManager.FindByIdAsync(userId.ToString());
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var user = await db.Users
+            .FromSqlInterpolated($"""SELECT * FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
         if (user is null)
         {
             return Result.Failure(new Error(
@@ -88,7 +95,6 @@ public static class AuthEndpoints
                 ErrorType.Authorization)).ToHttpResult(context);
         }
 
-        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
         var changed = await userManager.ChangePasswordAsync(user, request.CurrentPassword, request.NewPassword);
         if (!changed.Succeeded)
         {
@@ -184,7 +190,14 @@ public static class AuthEndpoints
                 "invalid_credentials", "The username or password is invalid.", ErrorType.Authentication)).ToHttpResult(httpContext);
         }
 
-        var user = await userManager.FindByNameAsync(request.UserName.Trim());
+        var normalizedName = userManager.NormalizeName(request.UserName.Trim());
+        var userId = await dbContext.Users.AsNoTracking()
+            .Where(user => user.NormalizedUserName == normalizedName)
+            .Select(user => (Guid?)user.Id).SingleOrDefaultAsync(httpContext.RequestAborted);
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(httpContext.RequestAborted);
+        var user = userId is null ? null : await dbContext.Users
+            .FromSqlInterpolated($"""SELECT * FROM "AspNetUsers" WHERE "Id" = {userId.Value} FOR UPDATE""")
+            .SingleOrDefaultAsync(httpContext.RequestAborted);
         if (user is null)
         {
             return Result<LoginResponse>.Failure(new Error(
@@ -199,6 +212,9 @@ public static class AuthEndpoints
             lockoutOnFailure: true);
         if (!signInResult.Succeeded)
         {
+            // Identity persists failed-attempt counters inside this transaction.
+            // A rejected login must not roll back lockout protection.
+            await transaction.CommitAsync(httpContext.RequestAborted);
             return Result<LoginResponse>.Failure(new Error(
                 "invalid_credentials",
                 "The username or password is invalid.",
@@ -207,7 +223,11 @@ public static class AuthEndpoints
 
         var roles = await userManager.GetRolesAsync(user);
         var statusFailure = TeacherStatusFailure(user, roles, httpContext);
-        if (statusFailure is not null) return statusFailure;
+        if (statusFailure is not null)
+        {
+            await transaction.CommitAsync(httpContext.RequestAborted);
+            return statusFailure;
+        }
         var refreshToken = tokenService.CreateRefreshToken();
         dbContext.RefreshTokens.Add(new RefreshToken
         {
@@ -217,6 +237,7 @@ public static class AuthEndpoints
             ExpiresAt = refreshToken.ExpiresAt
         });
         await dbContext.SaveChangesAsync(httpContext.RequestAborted);
+        await transaction.CommitAsync(httpContext.RequestAborted);
 
         return Result<LoginResponse>.Success(new LoginResponse(
             tokenService.CreateAccessToken(user, roles),
@@ -239,9 +260,18 @@ public static class AuthEndpoints
         if (request.RefreshToken.Length > 2048) return InvalidRefreshToken(httpContext);
 
         var hash = TokenService.HashRefreshToken(request.RefreshToken);
-        var storedToken = await dbContext.RefreshTokens
-            .Include(token => token.User)
-            .SingleOrDefaultAsync(token => token.TokenHash == hash, httpContext.RequestAborted);
+        var userId = await dbContext.RefreshTokens.AsNoTracking()
+            .Where(token => token.TokenHash == hash)
+            .Select(token => (Guid?)token.UserId).SingleOrDefaultAsync(httpContext.RequestAborted);
+        if (userId is null) return InvalidRefreshToken(httpContext);
+
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(httpContext.RequestAborted);
+        var user = await dbContext.Users
+            .FromSqlInterpolated($"""SELECT * FROM "AspNetUsers" WHERE "Id" = {userId.Value} FOR UPDATE""")
+            .SingleOrDefaultAsync(httpContext.RequestAborted);
+        if (user is null) return InvalidRefreshToken(httpContext);
+        var storedToken = await dbContext.RefreshTokens.AsNoTracking()
+            .SingleOrDefaultAsync(token => token.TokenHash == hash && token.UserId == user.Id, httpContext.RequestAborted);
 
         var now = timeProvider.GetUtcNow();
         if (storedToken is null || storedToken.RevokedAt is not null || storedToken.ExpiresAt <= now)
@@ -249,16 +279,16 @@ public static class AuthEndpoints
             return InvalidRefreshToken(httpContext);
         }
 
-        var roles = await userManager.GetRolesAsync(storedToken.User);
-        var statusFailure = TeacherStatusFailure(storedToken.User, roles, httpContext);
+        var roles = await userManager.GetRolesAsync(user);
+        var statusFailure = TeacherStatusFailure(user, roles, httpContext);
         if (statusFailure is not null)
         {
             await dbContext.RefreshTokens.Where(token => token.UserId == storedToken.UserId && token.RevokedAt == null)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(token => token.RevokedAt, now), httpContext.RequestAborted);
+            await transaction.CommitAsync(httpContext.RequestAborted);
             return statusFailure;
         }
 
-        await using var transaction = await dbContext.Database.BeginTransactionAsync(httpContext.RequestAborted);
         var revoked = await dbContext.RefreshTokens
             .Where(token => token.Id == storedToken.Id
                 && token.RevokedAt == null
@@ -284,7 +314,7 @@ public static class AuthEndpoints
         await transaction.CommitAsync(httpContext.RequestAborted);
 
         return Result<LoginResponse>.Success(new LoginResponse(
-            tokenService.CreateAccessToken(storedToken.User, roles),
+            tokenService.CreateAccessToken(user, roles),
             replacement.Value,
             tokenService.GetAccessTokenExpiration())).ToHttpResult(httpContext);
     }

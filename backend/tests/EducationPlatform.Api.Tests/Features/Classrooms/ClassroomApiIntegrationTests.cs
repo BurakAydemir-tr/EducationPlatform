@@ -28,7 +28,7 @@ using Npgsql;
 
 namespace EducationPlatform.Api.Tests.Features.Classrooms;
 
-public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
+public sealed partial class ClassroomApiIntegrationTests : IAsyncLifetime
 {
     private const string ConnectionStringVariable = "EducationPlatformTests__ConnectionString";
     private const string DatabasePrefix = "education_platform_tests_";
@@ -340,6 +340,13 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
         for (var attempt = 0; attempt < 2; attempt++)
             Assert.Equal(HttpStatusCode.Unauthorized,
                 (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-two", "wrong-password"))).StatusCode);
+
+        await using (var scope = _factory!.Services.CreateAsyncScope())
+        {
+            var user = await scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>()
+                .FindByNameAsync("teacher-two");
+            Assert.Equal(2, user!.AccessFailedCount);
+        }
 
         Assert.Equal(HttpStatusCode.OK,
             (await client.PostAsJsonAsync("/api/auth/login", new LoginRequest("teacher-two", Password))).StatusCode);
@@ -787,7 +794,11 @@ public sealed class ClassroomApiIntegrationTests : IAsyncLifetime
         {
             builder.ConfigureLogging(logging => logging.ClearProviders());
             builder.ConfigureServices(services =>
-                services.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider()));
+            {
+                services.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider());
+                services.AddSingleton<TimeProvider>(_authClock);
+                services.AddDbContext<EducationPlatformDbContext>(options => options.AddInterceptors(_authCommands));
+            });
             builder.ConfigureAppConfiguration((_, configuration) =>
                 configuration.AddInMemoryCollection(new Dictionary<string, string?>
                 {

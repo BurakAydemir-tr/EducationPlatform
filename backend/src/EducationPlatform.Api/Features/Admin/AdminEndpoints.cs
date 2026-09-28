@@ -74,10 +74,12 @@ public static class AdminEndpoints
         if (string.IsNullOrWhiteSpace(request.NewPassword))
             return InvalidNewPassword(context, "A new password is required.");
 
-        var teacher = await db.Users.SingleOrDefaultAsync(user => user.Id == teacherId, context.RequestAborted);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var teacher = await db.Users
+            .FromSqlInterpolated($"""SELECT * FROM "AspNetUsers" WHERE "Id" = {teacherId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
         if (teacher is null || !await users.IsInRoleAsync(teacher, RoleNames.Teacher)) return NotFound(context);
 
-        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
         var resetToken = await users.GeneratePasswordResetTokenAsync(teacher);
         var reset = await users.ResetPasswordAsync(teacher, resetToken, request.NewPassword);
         if (!reset.Succeeded)
@@ -98,10 +100,11 @@ public static class AdminEndpoints
         HttpContext context, EducationPlatformDbContext db, UserManager<ApplicationUser> users,
         TimeProvider timeProvider)
     {
-        var teacher = await db.Users.AsNoTracking().SingleOrDefaultAsync(user => user.Id == teacherId, context.RequestAborted);
-        if (teacher is null || !await users.IsInRoleAsync(teacher, RoleNames.Teacher)) return NotFound(context);
-
         await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var teacher = await db.Users
+            .FromSqlInterpolated($"""SELECT * FROM "AspNetUsers" WHERE "Id" = {teacherId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (teacher is null || !await users.IsInRoleAsync(teacher, RoleNames.Teacher)) return NotFound(context);
         var transitioned = await db.Users
             .Where(user => user.Id == teacherId && user.TeacherAccountStatus == expected)
             .ExecuteUpdateAsync(
