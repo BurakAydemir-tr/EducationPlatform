@@ -75,7 +75,8 @@ public static class CourseEndpoints
     {
         var validation = ValidateRequired(request.Title, 200, "Week title");
         if (validation is not null) return InvalidRequest(context, validation);
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         CourseWeek week;
         try
@@ -86,6 +87,7 @@ public static class CourseEndpoints
         { return InvalidOperation(context, exception.Message); }
         db.CourseWeeks.Add(week);
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{week.Id}", new WeekSummaryResponse(week.Id, week.Title, week.Order));
     }
 
@@ -93,7 +95,8 @@ public static class CourseEndpoints
     {
         var validation = ValidateWeekAndTopic(request.WeekTitle, request.ContentTitle, request.Text);
         if (validation is not null) return InvalidRequest(context, validation);
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         CourseWeek week;
         try
@@ -106,6 +109,7 @@ public static class CourseEndpoints
         { return InvalidOperation(context, exception.Message); }
         db.CourseWeeks.Add(week);
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{week.Id}", new WeekSummaryResponse(week.Id, week.Title, week.Order));
     }
 
@@ -113,7 +117,8 @@ public static class CourseEndpoints
     {
         var validation = ValidateWeekAndVideo(request.WeekTitle, request.ContentTitle, request.VideoUrl, request.Description);
         if (validation is not null) return InvalidRequest(context, validation);
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         CourseWeek week;
         try
@@ -126,6 +131,7 @@ public static class CourseEndpoints
         { return InvalidOperation(context, exception.Message); }
         db.CourseWeeks.Add(week);
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{week.Id}", new WeekSummaryResponse(week.Id, week.Title, week.Order));
     }
 
@@ -135,7 +141,8 @@ public static class CourseEndpoints
             ?? ValidateRequired(request.ContentTitle, 200, "Content title");
         if (validation is not null || request.QuizId == Guid.Empty)
             return InvalidRequest(context, validation ?? "Quiz identifier is required.");
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         var quizFailure = await ValidateAssignableQuizAsync(loaded.Course!, request.QuizId, context, db);
         if (quizFailure is not null) return quizFailure;
@@ -157,6 +164,7 @@ public static class CourseEndpoints
         {
             return QuizAlreadyAssigned(context);
         }
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{week.Id}", new WeekSummaryResponse(week.Id, week.Title, week.Order));
     }
 
@@ -164,7 +172,8 @@ public static class CourseEndpoints
     {
         var validation = ValidateTopic(request.Title, request.Text);
         if (validation is not null) return InvalidRequest(context, validation);
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         WeekContent content;
         try
@@ -175,6 +184,7 @@ public static class CourseEndpoints
         { return InvalidOperation(context, exception.Message); }
         db.WeekContents.Add(content);
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{weekId}/contents/{content.Id}", ToContent(content));
     }
 
@@ -182,7 +192,8 @@ public static class CourseEndpoints
     {
         var validation = ValidateVideo(request.Title, request.VideoUrl, request.Description);
         if (validation is not null) return InvalidRequest(context, validation);
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         WeekContent content;
         try
@@ -193,6 +204,7 @@ public static class CourseEndpoints
         { return InvalidOperation(context, exception.Message); }
         db.WeekContents.Add(content);
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{weekId}/contents/{content.Id}", ToContent(content));
     }
 
@@ -201,7 +213,8 @@ public static class CourseEndpoints
         var validation = ValidateRequired(request.Title, 200, "Content title");
         if (validation is not null || request.QuizId == Guid.Empty)
             return InvalidRequest(context, validation ?? "Quiz identifier is required.");
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         var quiz = await db.Quizzes.AsNoTracking()
             .Include(item => item.Questions)
@@ -228,12 +241,14 @@ public static class CourseEndpoints
         {
             return QuizAlreadyAssigned(context);
         }
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.Created($"/api/courses/{courseId}/weeks/{weekId}/contents/{content.Id}", ToContent(content));
     }
 
     private static async Task<IResult> ReorderWeeksAsync(Guid courseId, ReorderRequest request, HttpContext context, EducationPlatformDbContext db)
     {
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         if (request.Ids is null) return InvalidOrder(context, "Week order is required.");
         try
@@ -242,12 +257,14 @@ public static class CourseEndpoints
         }
         catch (InvalidOperationException exception) { return InvalidOrder(context, exception.Message); }
         await PersistWeekReorder(db, courseId, request.Ids, context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 
     private static async Task<IResult> ReorderContentsAsync(Guid courseId, Guid weekId, ReorderRequest request, HttpContext context, EducationPlatformDbContext db)
     {
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         if (request.Ids is null) return InvalidOrder(context, "Content order is required.");
         try
@@ -256,31 +273,28 @@ public static class CourseEndpoints
         }
         catch (InvalidOperationException exception) { return InvalidOrder(context, exception.Message); }
         await PersistContentReorder(db, weekId, request.Ids, context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 
     private static async Task PersistWeekReorder(EducationPlatformDbContext db, Guid courseId, IReadOnlyList<Guid> orderedIds, CancellationToken token)
     {
-        await using var transaction = await db.Database.BeginTransactionAsync(token);
         await db.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"CourseWeeks\" SET \"Order\" = -\"Order\" WHERE \"CourseId\" = {courseId}", token);
         for (var index = 0; index < orderedIds.Count; index++)
         {
             await db.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"CourseWeeks\" SET \"Order\" = {index + 1} WHERE \"Id\" = {orderedIds[index]}", token);
         }
         db.ChangeTracker.Clear();
-        await transaction.CommitAsync(token);
     }
 
     private static async Task PersistContentReorder(EducationPlatformDbContext db, Guid weekId, IReadOnlyList<Guid> orderedIds, CancellationToken token)
     {
-        await using var transaction = await db.Database.BeginTransactionAsync(token);
         await db.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"WeekContents\" SET \"Order\" = -\"Order\" WHERE \"CourseWeekId\" = {weekId} AND \"IsActive\" = TRUE", token);
         for (var index = 0; index < orderedIds.Count; index++)
         {
             await db.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"WeekContents\" SET \"Order\" = {index + 1} WHERE \"Id\" = {orderedIds[index]}", token);
         }
         db.ChangeTracker.Clear();
-        await transaction.CommitAsync(token);
     }
 
     private static async Task<IResult> UpdateTopicAsync(Guid courseId, Guid weekId, Guid contentId, UpdateTopicRequest request, HttpContext context, EducationPlatformDbContext db)
@@ -309,7 +323,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> DeactivateContentAsync(Guid courseId, Guid weekId, Guid contentId, HttpContext context, EducationPlatformDbContext db)
     {
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         try
         {
@@ -320,6 +335,7 @@ public static class CourseEndpoints
             return InvalidOperation(context, exception.Message);
         }
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 
@@ -371,7 +387,8 @@ public static class CourseEndpoints
 
     private static async Task<IResult> PublishAsync(Guid courseId, HttpContext context, EducationPlatformDbContext db)
     {
-        var loaded = await LoadOwnedCourse(courseId, context, db);
+        await using var transaction = await db.Database.BeginTransactionAsync(context.RequestAborted);
+        var loaded = await LoadOwnedCourseForUpdate(courseId, context, db);
         if (loaded.Failure is not null) return loaded.Failure;
         var quizIds = loaded.Course!.Weeks.SelectMany(week => week.Contents).Where(content => content.IsActive && content.Type == WeekContentType.Quiz).Select(content => content.QuizId!.Value).Distinct().ToList();
         if (quizIds.Count > 0)
@@ -382,6 +399,7 @@ public static class CourseEndpoints
         try { loaded.Course.Publish(); }
         catch (InvalidOperationException exception) { return Failure(context, "course_not_publishable", exception.Message, ErrorType.Conflict); }
         await db.SaveChangesAsync(context.RequestAborted);
+        await transaction.CommitAsync(context.RequestAborted);
         return Results.NoContent();
     }
 
@@ -405,6 +423,20 @@ public static class CourseEndpoints
         db.Courses.AsNoTracking().Where(course => course.Status == CourseStatus.Published
             && db.CourseClassroomAssignments.Any(assignment => assignment.CourseId == course.Id && assignment.RemovedAt == null
                 && db.ClassroomMemberships.Any(membership => membership.ClassroomId == assignment.ClassroomId && membership.StudentId == studentId && membership.LeftAt == null)));
+
+    // Caller owns the transaction: lock the root before materializing its mutable graph.
+    private static async Task<(Course? Course, IResult? Failure)> LoadOwnedCourseForUpdate(Guid courseId, HttpContext context, EducationPlatformDbContext db)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var teacherId)) return (null, Authentication(context));
+        var course = await db.Courses
+            .FromSqlInterpolated($"""SELECT * FROM "Courses" WHERE "Id" = {courseId} FOR UPDATE""")
+            .SingleOrDefaultAsync(context.RequestAborted);
+        if (course is null) return (null, CourseNotFound(context));
+        if (course.TeacherId != teacherId) return (null, Forbidden(context));
+        await db.Entry(course).Collection(item => item.Weeks).Query()
+            .Include(week => week.Contents).LoadAsync(context.RequestAborted);
+        return (course, null);
+    }
 
     private static async Task<(Course? Course, IResult? Failure)> LoadOwnedCourse(Guid courseId, HttpContext context, EducationPlatformDbContext db)
     {

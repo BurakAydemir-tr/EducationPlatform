@@ -24,7 +24,7 @@ using Npgsql;
 
 namespace EducationPlatform.Api.Tests.Features.Courses;
 
-public sealed class CourseApiIntegrationTests : IAsyncLifetime
+public sealed partial class CourseApiIntegrationTests : IAsyncLifetime
 {
     private const string ConnectionStringVariable = "EducationPlatformTests__ConnectionString";
     private const string DatabasePrefix = "education_platform_tests_";
