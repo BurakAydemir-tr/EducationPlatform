@@ -13,6 +13,7 @@ public static class QuizEndpoints
         var group = endpoints.MapGroup("/api/quizzes")
             .RequireAuthorization(policy => policy.RequireRole(RoleNames.Teacher));
         group.MapPost("/", CreateAsync);
+        group.MapGet("/", ListAsync);
         group.MapGet("/{quizId:guid}", GetAsync);
         group.MapPut("/{quizId:guid}", UpdateAsync);
         return endpoints;
@@ -55,6 +56,18 @@ public static class QuizEndpoints
         if (quiz is null) return Failure(context, "quiz_not_found", "Quiz was not found.", ErrorType.NotFound);
         if (quiz.TeacherId != teacherId) return Failure(context, "forbidden", "You cannot access another teacher's quiz.", ErrorType.Authorization);
         return Results.Ok(ToResponse(quiz));
+    }
+
+    private static async Task<IResult> ListAsync(HttpContext context, EducationPlatformDbContext db)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var teacherId))
+            return Failure(context, "authentication_required", "Authentication is required.", ErrorType.Authentication);
+        var quizzes = await db.Quizzes.AsNoTracking().Where(quiz => quiz.TeacherId == teacherId)
+            .OrderBy(quiz => quiz.Title).ThenBy(quiz => quiz.Id)
+            .Select(quiz => new QuizSummaryResponse(quiz.Id, quiz.Title, quiz.IsLocked,
+                db.WeekContents.Any(content => content.QuizId == quiz.Id)))
+            .ToListAsync(context.RequestAborted);
+        return Results.Ok(quizzes);
     }
 
     private static async Task<IResult> UpdateAsync(Guid quizId, UpdateQuizRequest request, HttpContext context, EducationPlatformDbContext db)
@@ -138,6 +151,7 @@ public sealed record CreateQuizRequest(string Title, IReadOnlyList<CreateQuestio
 public sealed record CreateQuestionRequest(string Text, int Order, IReadOnlyList<CreateOptionRequest?> Options);
 public sealed record CreateOptionRequest(string Text, int Order, bool IsCorrect);
 public sealed record CreateQuizResponse(Guid Id, string Title);
+public sealed record QuizSummaryResponse(Guid Id, string Title, bool IsLocked, bool IsAssigned);
 public sealed record UpdateQuizRequest(string Title, IReadOnlyList<CreateQuestionRequest?> Questions);
 public sealed record QuizDetailResponse(Guid Id, string Title, bool IsLocked, IReadOnlyList<TeacherQuizQuestionResponse> Questions);
 public sealed record TeacherQuizQuestionResponse(Guid Id, string Text, int Order, IReadOnlyList<TeacherQuizOptionResponse> Options);

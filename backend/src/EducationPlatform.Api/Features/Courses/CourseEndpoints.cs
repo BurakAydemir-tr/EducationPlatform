@@ -19,6 +19,8 @@ public static class CourseEndpoints
         teacher.MapPost("/", CreateAsync);
         teacher.MapGet("/", ListTeacherCoursesAsync);
         teacher.MapGet("/{courseId:guid}", GetTeacherCourseAsync);
+        teacher.MapGet("/{courseId:guid}/classrooms", ListCourseClassroomsAsync);
+        teacher.MapGet("/{courseId:guid}/students", ListCourseStudentsAsync);
         teacher.MapPost("/{courseId:guid}/weeks", AddWeekAsync);
         teacher.MapPost("/{courseId:guid}/weeks/with-topic", AddPublishedWeekWithTopicAsync);
         teacher.MapPost("/{courseId:guid}/weeks/with-video", AddPublishedWeekWithVideoAsync);
@@ -69,6 +71,42 @@ public static class CourseEndpoints
         if (!CurrentUser.TryGetId(context.User, out var teacherId)) return Authentication(context);
         var course = await OwnedCourseQuery(db, courseId, teacherId, tracking: false).SingleOrDefaultAsync(context.RequestAborted);
         return course is null ? CourseNotFound(context) : Results.Ok(ToDetail(course));
+    }
+
+    private static async Task<IResult> ListCourseClassroomsAsync(Guid courseId, HttpContext context, EducationPlatformDbContext db)
+    {
+        var failure = await ValidateCourseOwnershipAsync(courseId, context, db);
+        if (failure is not null) return failure;
+        var classrooms = await (from assignment in db.CourseClassroomAssignments.AsNoTracking()
+            join classroom in db.Classrooms.AsNoTracking() on assignment.ClassroomId equals classroom.Id
+            where assignment.CourseId == courseId && assignment.RemovedAt == null
+            orderby classroom.Name, classroom.Id
+            select new CourseClassroomResponse(classroom.Id, classroom.Name))
+            .ToListAsync(context.RequestAborted);
+        return Results.Ok(classrooms);
+    }
+
+    private static async Task<IResult> ListCourseStudentsAsync(Guid courseId, HttpContext context, EducationPlatformDbContext db)
+    {
+        var failure = await ValidateCourseOwnershipAsync(courseId, context, db);
+        if (failure is not null) return failure;
+        var students = await db.Users.AsNoTracking()
+            .Where(user => db.CourseClassroomAssignments.Any(assignment => assignment.CourseId == courseId
+                && db.ClassroomMemberships.Any(membership => membership.ClassroomId == assignment.ClassroomId
+                    && membership.StudentId == user.Id)))
+            .OrderBy(user => user.Name).ThenBy(user => user.Id)
+            .Select(user => new CourseStudentResponse(user.Id, user.Name, user.UserName!, user.StudentCode))
+            .ToListAsync(context.RequestAborted);
+        return Results.Ok(students);
+    }
+
+    private static async Task<IResult?> ValidateCourseOwnershipAsync(Guid courseId, HttpContext context, EducationPlatformDbContext db)
+    {
+        if (!CurrentUser.TryGetId(context.User, out var teacherId)) return Authentication(context);
+        var ownerId = await db.Courses.AsNoTracking().Where(course => course.Id == courseId)
+            .Select(course => (Guid?)course.TeacherId).SingleOrDefaultAsync(context.RequestAborted);
+        if (ownerId is null) return CourseNotFound(context);
+        return ownerId == teacherId ? null : Forbidden(context);
     }
 
     private static async Task<IResult> AddWeekAsync(Guid courseId, AddWeekRequest request, HttpContext context, EducationPlatformDbContext db)
@@ -529,6 +567,8 @@ public static class CourseEndpoints
 public sealed record CreateCourseRequest(string Title, string? Description);
 public sealed record CreateCourseResponse(Guid Id, string Title, string? Description, CourseStatus Status);
 public sealed record CourseSummaryResponse(Guid Id, string Title, string? Description, CourseStatus Status);
+public sealed record CourseClassroomResponse(Guid ClassroomId, string Name);
+public sealed record CourseStudentResponse(Guid StudentId, string Name, string UserName, string? StudentCode);
 public sealed record AddWeekRequest(string Title, int Order);
 public sealed record AddPublishedWeekWithTopicRequest(string WeekTitle, int WeekOrder, string ContentTitle, string Text);
 public sealed record AddPublishedWeekWithVideoRequest(string WeekTitle, int WeekOrder, string ContentTitle, string VideoUrl, string? Description);

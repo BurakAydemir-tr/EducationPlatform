@@ -257,14 +257,19 @@ public static class LearningEndpoints
             orderby week.Order, content.Order
             select new { WeekId = week.Id, WeekTitle = week.Title, WeekOrder = week.Order, ContentId = content.Id }).ToListAsync(token);
         var contentIds = contents.Select(item => item.ContentId).ToList();
-        var completedIds = await db.ContentProgress.AsNoTracking()
+        var completed = await db.ContentProgress.AsNoTracking()
             .Where(item => item.StudentId == studentId && contentIds.Contains(item.ContentId))
-            .Select(item => item.ContentId).ToHashSetAsync(token);
+            .Select(item => new CompletedContentResponse(item.ContentId, item.CompletedAt))
+            .ToListAsync(token);
+        var completedAtById = completed.ToDictionary(item => item.ContentId, item => item.CompletedAt);
+        var completedIds = completedAtById.Keys.ToHashSet();
+        var completedContents = contents.Where(item => completedAtById.ContainsKey(item.ContentId))
+            .Select(item => new CompletedContentResponse(item.ContentId, completedAtById[item.ContentId])).ToList();
         var weeks = contents.GroupBy(item => new { item.WeekId, item.WeekTitle, item.WeekOrder })
             .Select(group => new WeekProgressResponse(group.Key.WeekId, group.Key.WeekTitle, group.Key.WeekOrder,
                 group.Count(item => completedIds.Contains(item.ContentId)), group.Count(), Percentage(group.Count(item => completedIds.Contains(item.ContentId)), group.Count())))
             .OrderBy(item => item.Order).ToList();
-        return new CourseProgressResponse(courseId, completedIds.Count, contents.Count, Percentage(completedIds.Count, contents.Count), weeks);
+        return new CourseProgressResponse(courseId, completedIds.Count, contents.Count, Percentage(completedIds.Count, contents.Count), weeks, completedContents);
     }
 
     private static async Task<IResult?> ValidateTeacherReportAccess(Guid courseId, Guid studentId, HttpContext context, EducationPlatformDbContext db)
@@ -311,6 +316,7 @@ public sealed record QuizOptionResponse(Guid Id, string Text, int Order);
 public sealed record CompleteQuizAttemptRequest(IReadOnlyList<QuizAnswerRequest?>? Answers);
 public sealed record QuizAnswerRequest(Guid QuestionId, Guid SelectedOptionId);
 public sealed record QuizAttemptResultResponse(Guid AttemptId, Guid QuizId, DateTimeOffset StartedAt, DateTimeOffset CompletedAt, int CorrectAnswerCount, int QuestionCount, decimal Score);
-public sealed record CourseProgressResponse(Guid CourseId, int CompletedContentCount, int TotalContentCount, decimal Percentage, IReadOnlyList<WeekProgressResponse> Weeks);
+public sealed record CourseProgressResponse(Guid CourseId, int CompletedContentCount, int TotalContentCount, decimal Percentage, IReadOnlyList<WeekProgressResponse> Weeks, IReadOnlyList<CompletedContentResponse> CompletedContents);
+public sealed record CompletedContentResponse(Guid ContentId, DateTimeOffset CompletedAt);
 public sealed record WeekProgressResponse(Guid WeekId, string Title, int Order, int CompletedContentCount, int TotalContentCount, decimal Percentage);
 public sealed record TeacherQuizResultResponse(Guid QuizId, string QuizTitle, int AttemptCount, decimal FirstScore, decimal LastScore, decimal BestScore, DateTimeOffset LastAttemptAt);
