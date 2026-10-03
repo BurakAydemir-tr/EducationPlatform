@@ -316,7 +316,7 @@ MVP’de ayrı Audit Log sistemi olmayacaktır; business değişiklik geçmişi 
 
 ## 14. Frontend
 
-Frontend React ve TypeScript ile feature-based organize edilecektir.
+Frontend React ve TypeScript ile feature-based organize edilecektir. MVP arayüz bileşenleri ve tema için Material UI (MUI) kullanılacaktır.
 
 ```text
 frontend/src/
